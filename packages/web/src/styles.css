@@ -745,75 +745,55 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
   bottom: 20px;
   left: 50%;
   transform: translateX(-50%);
-  width: min(560px, calc(100% - 40px));
+  width: min(600px, calc(100% - 40px));
   z-index: 20;
 
   backdrop-filter: blur(40px) saturate(2);
   -webkit-backdrop-filter: blur(40px) saturate(2);
-  background: var(--glass);
+  background: var(--glass-strong);
   border: 1px solid var(--glass-border);
-  border-radius: 20px;
+  border-radius: 18px;
   box-shadow: var(--shadow), 0 0 0 0.5px var(--glass-border);
-  padding: 12px 14px;
-  display: grid;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 12px 14px 10px;
 }
 
 :root[data-theme="light"] .chat-float {
-  background: rgba(255, 255, 255, 0.82);
-  border-color: rgba(0, 0, 0, 0.08);
-  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.12), 0 0 0 0.5px rgba(0,0,0,0.06);
+  background: rgba(255, 255, 255, 0.92);
+  border-color: rgba(0, 0, 0, 0.10);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.13), 0 0 0 0.5px rgba(0,0,0,0.06);
+}
+
+/* Chips row — shown above textarea when comments exist */
+.chat-float-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 10px;
+}
+
+/* Textarea + send button side by side */
+.chat-float-input-row {
+  align-items: flex-end;
+  display: flex;
+  gap: 8px;
 }
 
 .chat-float-input {
   background: transparent;
   border: 0;
   color: var(--text);
+  flex: 1 1 0;
   font-size: 14px;
   line-height: 1.5;
+  min-width: 0;
   outline: none;
   padding: 0;
   resize: none;
-  width: 100%;
 }
 .chat-float-input::placeholder { color: var(--text-muted); }
-
-.chat-float-session {
-  color: var(--text-muted);
-  font-size: 11px;
-  font-weight: 500;
-  padding-bottom: 6px;
-  border-bottom: 1px solid var(--glass-border);
-  margin-bottom: 8px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.chat-float-footer {
-  align-items: center;
-  border-top: 1px solid var(--glass-border);
-  display: flex;
-  justify-content: space-between;
-  padding-top: 8px;
-  gap: 8px;
-  min-width: 0;
-  overflow: hidden;
-}
-
-.chat-float-hints {
-  align-items: center;
-  display: flex;
-  flex: 1 1 0;
-  flex-wrap: nowrap;
-  gap: 6px;
-  min-width: 0;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-.chat-float-hints::-webkit-scrollbar { display: none; }
-
-.chat-float-hint { color: var(--text-muted); font-size: 11px; }
 
 .comment-chip {
   align-items: center;

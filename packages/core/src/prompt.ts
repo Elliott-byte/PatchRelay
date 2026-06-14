@@ -1,16 +1,34 @@
 import type { DiffFile, DiffHunk, DiffLine, DiffResponse, ReviewComment } from './types.js';
 
-export function buildReviewPrompt(
+export interface AgentInput {
+  systemPrompt: string;
+  userMessage: string;
+}
+
+export function buildAgentInput(
   diff: DiffResponse,
   comments: ReviewComment[],
   customMessage?: string
-): string {
-  const openComments = comments.filter((comment) => comment.status === 'open');
+): AgentInput {
+  const openComments = comments.filter((c) => c.status === 'open');
+
+  if (openComments.length > 0) {
+    return buildReviewInput(diff, openComments, customMessage);
+  }
+
+  return buildChatInput(diff, customMessage);
+}
+
+function buildReviewInput(
+  diff: DiffResponse,
+  openComments: ReviewComment[],
+  customMessage?: string
+): AgentInput {
   const commentSections = openComments.map((comment, index) =>
     formatCommentSection(index + 1, comment, diff.files)
   );
 
-  return [
+  const systemPrompt = [
     'You are fixing local human review comments in a git working tree.',
     '',
     'Instructions:',
@@ -29,18 +47,39 @@ export function buildReviewPrompt(
     '',
     `Open review comments: ${openComments.length}`,
     '',
-    openComments.length > 0
-      ? commentSections.join('\n\n')
-      : 'There are no open review comments. Do not make code changes unless explicitly necessary.',
+    commentSections.join('\n\n'),
     '',
-    'After making fixes, summarize:',
-    '- What changed',
-    '- Which comments were addressed',
-    '- Any tests run or skipped',
-    ...(customMessage?.trim()
-      ? ['', '---', 'Additional instructions from the reviewer:', customMessage.trim()]
-      : [])
+    'After making fixes, summarize what changed, which comments were addressed, and any tests run.',
   ].join('\n');
+
+  const userMessage = customMessage?.trim() ?? 'Fix all open review comments.';
+
+  return { systemPrompt, userMessage };
+}
+
+function buildChatInput(diff: DiffResponse, customMessage?: string): AgentInput {
+  const fileSummary = diff.files.length > 0
+    ? ` There are currently ${diff.files.length} changed file(s): ${diff.files.map(f => f.newPath !== '/dev/null' ? f.newPath : f.oldPath).join(', ')}.`
+    : '';
+
+  const systemPrompt = [
+    `You are a coding assistant working in the repository "${diff.repo.repoName}" on branch "${diff.repo.branch}".`,
+    `Repo root: ${diff.repo.repoRoot}.${fileSummary}`,
+  ].join('\n');
+
+  const userMessage = customMessage?.trim() ?? '';
+
+  return { systemPrompt, userMessage };
+}
+
+// Legacy export — kept so any external callers don't break
+export function buildAgentPrompt(
+  diff: DiffResponse,
+  comments: ReviewComment[],
+  customMessage?: string
+): string {
+  const { systemPrompt, userMessage } = buildAgentInput(diff, comments, customMessage);
+  return [systemPrompt, '', userMessage].join('\n');
 }
 
 function formatCommentSection(index: number, comment: ReviewComment, files: DiffFile[]): string {
@@ -65,14 +104,12 @@ function formatCommentSection(index: number, comment: ReviewComment, files: Diff
 }
 
 function findRelevantHunk(file: DiffFile, comment: ReviewComment): DiffHunk | undefined {
-  const exactHeader = file.hunks.find((hunk) => hunk.header === comment.hunkHeader);
-  if (exactHeader) {
-    return exactHeader;
-  }
-
-  return file.hunks.find((hunk) =>
-    hunk.lines.some((line) =>
-      comment.side === 'new' ? line.newLine === comment.line : line.oldLine === comment.line
+  return (
+    file.hunks.find((hunk) => hunk.header === comment.hunkHeader) ??
+    file.hunks.find((hunk) =>
+      hunk.lines.some((line) =>
+        comment.side === 'new' ? line.newLine === comment.line : line.oldLine === comment.line
+      )
     )
   );
 }
@@ -85,12 +122,8 @@ function formatHunk(hunk: DiffHunk): string {
 }
 
 function linePrefix(line: DiffLine): string {
-  if (line.type === 'add') {
-    return '+';
-  }
-  if (line.type === 'remove') {
-    return '-';
-  }
+  if (line.type === 'add') return '+';
+  if (line.type === 'remove') return '-';
   return ' ';
 }
 

@@ -1,9 +1,10 @@
 import { createReadStream } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
+import os from 'node:os';
 import http, { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import {
-  buildReviewPrompt,
+  buildAgentInput,
   checkoutBranch,
   createBranch,
   deleteBranch,
@@ -129,17 +130,16 @@ async function handleApiRequest(
 
   if (method === 'GET' && pathName === '/api/models') {
     const provider = url.searchParams.get('provider') ?? 'claude';
-    const models = provider === 'codex'
-      ? [
-          { id: 'o4-mini',  label: 'o4-mini' },
-          { id: 'gpt-4.1',  label: 'GPT-4.1' },
-          { id: 'gpt-4o',   label: 'GPT-4o' },
-        ]
-      : [
-          { id: 'claude-sonnet-4-6',           label: 'Sonnet 4.6' },
-          { id: 'claude-opus-4-8',             label: 'Opus 4.8' },
-          { id: 'claude-haiku-4-5-20251001',   label: 'Haiku 4.5' },
-        ];
+    let models: { id: string; label: string }[];
+    if (provider === 'codex') {
+      models = await loadCodexModels();
+    } else {
+      models = [
+        { id: 'claude-sonnet-4-6',         label: 'Sonnet 4.6' },
+        { id: 'claude-opus-4-8',           label: 'Opus 4.8' },
+        { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+      ];
+    }
     sendJson(res, 200, { models });
     return;
   }
@@ -234,9 +234,11 @@ async function handleApiRequest(
   }
 
   if (method === 'POST' && pathName === '/api/prompt/build') {
+    const config = await loadConfig(repoRoot);
     const { message } = await readJson<{ message?: string }>(req);
-    const prompt = await buildPrompt(repoRoot, message);
-    sendJson(res, 200, { prompt });
+    const [diff, comments] = await Promise.all([getDiffResponse(repoRoot, config), listComments(repoRoot)]);
+    const { systemPrompt, userMessage } = buildAgentInput(diff, comments, message);
+    sendJson(res, 200, { prompt: [systemPrompt, '', userMessage].join('\n') });
     return;
   }
 
@@ -251,21 +253,42 @@ async function handleApiRequest(
   sendJson(res, 404, { error: 'Not found.' });
 }
 
-async function buildPrompt(repoRoot: string, customMessage?: string): Promise<string> {
+async function loadCodexModels(): Promise<{ id: string; label: string }[]> {
+  const cachePath = path.join(os.homedir(), '.codex', 'models_cache.json');
+  try {
+    const raw = await readFile(cachePath, 'utf8');
+    const cache = JSON.parse(raw) as {
+      models: { slug: string; display_name: string; visibility?: string }[];
+    };
+    const visible = cache.models
+      .filter((m) => m.visibility === 'list')
+      .map((m) => ({ id: m.slug, label: m.display_name }));
+    return [{ id: '', label: 'Default' }, ...visible];
+  } catch {
+    return [{ id: '', label: 'Default' }];
+  }
+}
+
+async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: string, model?: string) {
   const config = await loadConfig(repoRoot);
   const [diff, comments] = await Promise.all([
     getDiffResponse(repoRoot, config),
     listComments(repoRoot)
   ]);
-  return buildReviewPrompt(diff, comments, customMessage);
-}
+  const { systemPrompt, userMessage } = buildAgentInput(diff, comments, customMessage);
 
-async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: string, model?: string) {
-  const config = await loadConfig(repoRoot);
-  const prompt = await buildPrompt(repoRoot, customMessage);
   let command = kind === 'codex' ? config.codexCommand : config.claudeCommand;
   if (model) command = `${command} --model ${model}`;
-  return runAgentCommand(command, prompt, repoRoot);
+
+  // Claude supports --system-prompt so context stays out of the user message.
+  // Codex exec doesn't, so concatenate for that case.
+  if (kind === 'claude') {
+    command = `${command} --system-prompt ${JSON.stringify(systemPrompt)}`;
+    return runAgentCommand(command, userMessage, repoRoot);
+  } else {
+    const fullPrompt = [systemPrompt, '', userMessage].filter(Boolean).join('\n');
+    return runAgentCommand(command, fullPrompt, repoRoot);
+  }
 }
 
 async function serveStatic(

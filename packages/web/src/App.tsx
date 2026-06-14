@@ -75,7 +75,7 @@ export function App() {
     const id = window.setInterval(() => {
       if (inFlight) return;
       inFlight = true;
-      void Promise.all([refresh(false), loadSessionList(false)])
+      void Promise.all([refresh(false), loadSessionList(false), loadBranches()])
         .catch((e) => setError(msgFor(e)))
         .finally(() => { inFlight = false; });
     }, 3000);
@@ -268,17 +268,22 @@ export function App() {
         [r.error ? `Error: ${r.error}` : '', r.stdout, r.stderr ? `stderr:\n${r.stderr}` : '']
           .filter(Boolean).join('\n\n')
       );
-      await Promise.all([refresh(false), loadSessionList(false)]);
+      const [, sessionsResp] = await Promise.all([
+        refresh(false),
+        api<{ sessions: SessionListItem[] }>('/api/sessions'),
+      ]);
+      setSessionList(sessionsResp.sessions);
       // auto-select the newest session for this provider
-      const latest = sessionList.filter(s => s.source === kind)[0];
+      const latest = sessionsResp.sessions.filter(s => s.source === kind)[0];
       if (latest) { setActiveSessionId(latest.id); void loadSession(latest.id); }
     } catch (e) { setError(msgFor(e)); }
     finally { setBusy(false); }
   }
 
-  async function newSession() {
-    flash(`Starting new ${activeProvider === 'claude' ? 'Claude Code' : 'Codex'} session…`);
-    await sendToAgent(activeProvider);
+  function newSession() {
+    setActiveSessionId(undefined);
+    setActiveSession(undefined);
+    setAgentOutput('');
   }
 
   function flash(msg: string) {
@@ -449,9 +454,8 @@ export function App() {
           {/* Floating chat compose */}
           <FloatingCompose
             busy={busy}
-            agentOutput={agentOutput}
             openComments={openComments}
-            sessionSource={activeSessionSource}
+            activeProvider={activeProvider}
             sessionTitle={activeSessionTitle}
             commitMessage={commitMessage}
             onSend={(msg) => void sendToAgent(activeProvider, msg)}
@@ -472,7 +476,13 @@ export function App() {
               setActiveProvider(p);
               void loadModels(p);
               const first = sessionList.find(s => s.source === p);
-              if (first) { setActiveSessionId(first.id); void loadSession(first.id); }
+              if (first) {
+                setActiveSessionId(first.id);
+                void loadSession(first.id);
+              } else {
+                setActiveSessionId(undefined);
+                setActiveSession(undefined);
+              }
             }}
             onModelChange={setActiveModel}
             onSelectSession={selectSession}
@@ -605,9 +615,8 @@ function BranchSelector({ current, branches, switching, onSwitch, onCreate, onDe
 
 interface FloatingComposeProps {
   busy: boolean;
-  agentOutput: string;
   openComments: ReviewComment[];
-  sessionSource?: 'codex' | 'claude';
+  activeProvider: AgentKind;
   sessionTitle?: string;
   commitMessage: string;
   onSend: (msg: string) => void;
@@ -615,62 +624,61 @@ interface FloatingComposeProps {
 
 function FloatingCompose(props: FloatingComposeProps) {
   const [msg, setMsg] = useState('');
-  const label = props.sessionSource === 'codex' ? 'Codex' : 'Claude Code';
-  const shortTitle = props.sessionTitle ?? null;
+  const label = props.activeProvider === 'codex' ? 'Codex' : 'Claude Code';
 
   function handleSend() {
     props.onSend(msg);
     setMsg('');
   }
 
+  const grouped = Object.entries(
+    props.openComments.reduce<Record<string, { file: string; lines: number[] }>>((acc, c) => {
+      const base = c.file.split('/').pop() ?? c.file;
+      const stem = base.includes('.') ? base.slice(0, base.lastIndexOf('.')) : base;
+      if (!acc[stem]) acc[stem] = { file: c.file, lines: [] };
+      acc[stem].lines.push(c.line);
+      return acc;
+    }, {})
+  );
+
   return (
     <div className="chat-float">
-      {shortTitle && <div className="chat-float-session">{label} · {shortTitle}</div>}
-      <textarea
-        className="chat-float-input"
-        value={msg}
-        onChange={(e) => setMsg(e.target.value)}
-        placeholder={`Ask ${label} to edit your code…`}
-        rows={3}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); handleSend(); }
-        }}
-      />
-      <div className="chat-float-footer">
-        <div className="chat-float-hints">
-          {Object.entries(
-            props.openComments.reduce<Record<string, { file: string; lines: number[] }>>((acc, c) => {
-              const base = c.file.split('/').pop() ?? c.file;
-              const stem = base.includes('.') ? base.slice(0, base.lastIndexOf('.')) : base;
-              if (!acc[stem]) acc[stem] = { file: c.file, lines: [] };
-              acc[stem].lines.push(c.line);
-              return acc;
-            }, {})
-          ).map(([stem, { file, lines }]) => (
-            <span
-              key={stem}
-              className="comment-chip"
-              title={`${file} — lines ${lines.join(', ')}`}
-            >
+      {grouped.length > 0 && (
+        <div className="chat-float-chips">
+          {grouped.map(([stem, { file, lines }]) => (
+            <span key={stem} className="comment-chip" title={`${file} — lines ${lines.join(', ')}`}>
               <span className="chip-dot" />
               {stem}{lines.length > 1 ? ` (${lines.length})` : `:${lines[0]}`}
             </span>
           ))}
-          {props.openComments.length === 0 && props.commitMessage.trim() && !msg && (
-            <button
-              className="chat-float-suggestion"
-              onClick={() => setMsg(props.commitMessage.trim())}
-              title="Use commit message as instruction"
-            >
-              💡 {props.commitMessage.trim().slice(0, 40)}{props.commitMessage.trim().length > 40 ? '…' : ''}
-            </button>
-          )}
         </div>
+      )}
+      {props.openComments.length === 0 && props.commitMessage.trim() && !msg && (
+        <div className="chat-float-chips">
+          <button
+            className="chat-float-suggestion"
+            onClick={() => setMsg(props.commitMessage.trim())}
+            title="Use commit message as instruction"
+          >
+            💡 {props.commitMessage.trim().slice(0, 60)}{props.commitMessage.trim().length > 60 ? '…' : ''}
+          </button>
+        </div>
+      )}
+      <div className="chat-float-input-row">
+        <textarea
+          className="chat-float-input"
+          value={msg}
+          onChange={(e) => setMsg(e.target.value)}
+          placeholder={`Ask ${label} to edit your code…`}
+          rows={2}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+          }}
+        />
         <button className="chat-float-send" disabled={props.busy} onClick={handleSend}>
           {props.busy ? '…' : '↑'}
         </button>
       </div>
-      {props.agentOutput ? <pre className="agent-output-inline">{props.agentOutput}</pre> : null}
     </div>
   );
 }
@@ -734,22 +742,38 @@ function DropdownSelect({ value, options, onChange, placeholder, disabled }: {
 
 // ── Message bubble ────────────────────────────────────────────────────────────
 
-function MessageBubble({ msg, source }: { msg: CodexSessionMessage; source?: 'codex' | 'claude' }) {
-  const isUser = msg.role === 'user';
+function groupMessages(messages: CodexSessionMessage[]): CodexSessionMessage[][] {
+  const groups: CodexSessionMessage[][] = [];
+  for (const msg of messages) {
+    const last = groups[groups.length - 1];
+    if (last && last[0].role === msg.role) {
+      last.push(msg);
+    } else {
+      groups.push([msg]);
+    }
+  }
+  return groups;
+}
+
+function MessageBubble({ msgs, source }: { msgs: CodexSessionMessage[]; source?: 'codex' | 'claude' }) {
+  const first = msgs[0];
+  const isUser = first.role === 'user';
   const roleLabel = isUser ? 'You' : source === 'claude' ? 'Claude' : 'Codex';
   return (
-    <div className={`msg msg-${msg.role}`}>
+    <div className={`msg msg-${first.role}`}>
       <div className="msg-header">
         <span className="msg-role">{roleLabel}</span>
-        <span className="msg-time">{formatDate(msg.timestamp)}</span>
+        <span className="msg-time">{formatDate(first.timestamp)}</span>
       </div>
-      <div className="msg-body">
-        {msg.text
-          ? isUser
-            ? <span className="msg-plain">{msg.text}</span>
-            : <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
-          : <em className="msg-empty">(empty)</em>}
-      </div>
+      {msgs.map((msg, i) => (
+        <div key={msg.id ?? i} className="msg-body">
+          {msg.text
+            ? isUser
+              ? <span className="msg-plain">{msg.text}</span>
+              : <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
+            : <em className="msg-empty">(empty)</em>}
+        </div>
+      ))}
     </div>
   );
 }
@@ -825,7 +849,7 @@ function SessionPanel(props: SessionPanelProps) {
         </div>
       )}
 
-      {/* Messages — oldest first, scroll to bottom */}
+      {/* Messages — oldest first, scroll to bottom, grouped by consecutive role */}
       <div className="session-messages">
         {props.sessionLoading ? (
           <div className="session-unavailable">Loading…</div>
@@ -833,8 +857,8 @@ function SessionPanel(props: SessionPanelProps) {
           <div className="session-unavailable">{session.unavailableReason}</div>
         ) : messages.length ? (
           <>
-            {messages.map((msg) => (
-              <MessageBubble key={msg.id} msg={msg} source={activeItem?.source} />
+            {groupMessages(messages).map((group) => (
+              <MessageBubble key={group[0].id} msgs={group} source={activeItem?.source} />
             ))}
             <div ref={bottomRef} />
           </>
