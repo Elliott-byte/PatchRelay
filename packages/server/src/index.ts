@@ -1,11 +1,16 @@
+import { execFile } from 'node:child_process';
 import { createReadStream } from 'node:fs';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import os from 'node:os';
 import http, { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import path from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 import {
   buildAgentInput,
   checkoutBranch,
+  findGitRoot,
   createBranch,
   deleteBranch,
   commitChanges,
@@ -62,6 +67,8 @@ export async function startPatchRelayServer(
 
 export function createPatchRelayServer(options: PatchRelayServerOptions): Server {
   const staticRoot = options.staticDir ? path.resolve(options.staticDir) : undefined;
+  // mutable so the repo can be switched at runtime without restarting
+  const state = { repoRoot: options.repoRoot };
 
   return http.createServer(async (req, res) => {
     try {
@@ -72,7 +79,7 @@ export function createPatchRelayServer(options: PatchRelayServerOptions): Server
 
       const url = new URL(req.url, 'http://127.0.0.1');
       if (url.pathname.startsWith('/api/')) {
-        await handleApiRequest(req, res, url, options.repoRoot);
+        await handleApiRequest(req, res, url, state);
         return;
       }
 
@@ -87,8 +94,9 @@ async function handleApiRequest(
   req: IncomingMessage,
   res: ServerResponse,
   url: URL,
-  repoRoot: string
+  state: { repoRoot: string }
 ): Promise<void> {
+  const repoRoot = state.repoRoot;
   const method = req.method ?? 'GET';
   const pathName = url.pathname;
 
@@ -244,13 +252,158 @@ async function handleApiRequest(
 
   if (method === 'POST' && (pathName === '/api/agent/codex' || pathName === '/api/agent/claude')) {
     const kind: AgentKind = pathName.endsWith('/codex') ? 'codex' : 'claude';
-    const { message, model } = await readJson<{ message?: string; model?: string }>(req);
-    const result = await runAgent(repoRoot, kind, message, model);
-    sendJson(res, result.success ? 200 : 500, result);
+    const { message, model, sessionId } = await readJson<{ message?: string; model?: string; sessionId?: string }>(req);
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    (res.socket as import('node:net').Socket | null)?.setNoDelay(true);
+    const ac = new AbortController();
+    req.on('close', () => { if (!res.writableEnded) ac.abort(); });
+    const result = await runAgent(repoRoot, kind, message, model, sessionId, (chunk) => {
+      res.write(`data: ${JSON.stringify({ type: 'chunk', text: chunk })}\n\n`);
+    }, ac.signal);
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ type: 'done', success: result.success, error: result.error, stderr: result.stderr })}\n\n`);
+      res.end();
+    }
+    return;
+  }
+
+  if (method === 'POST' && pathName === '/api/repo/pick') {
+    let stdout = '';
+    try {
+      if (process.platform === 'win32') {
+        // PowerShell folder picker
+        const psScript = [
+          'Add-Type -AssemblyName System.Windows.Forms',
+          '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
+          '$d.Description = "Select a git repository folder"',
+          'if ($d.ShowDialog() -eq "OK") { $d.SelectedPath } else { exit 1 }',
+        ].join('; ');
+        ({ stdout } = await execFileAsync('powershell', ['-NoProfile', '-Command', psScript]));
+      } else {
+        const script = 'POSIX path of (choose folder with prompt "Select a git repository folder:")';
+        ({ stdout } = await execFileAsync('osascript', ['-e', script]));
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // osascript: user cancel = exit code -128; PowerShell: exit 1 when cancelled
+      if (msg.includes('-128') || /cancel/i.test(msg) || /exit code 1/i.test(msg)) {
+        sendJson(res, 200, { cancelled: true });
+      } else {
+        sendJson(res, 500, { error: msg });
+      }
+      return;
+    }
+    const chosen = stdout.trim().replace(/[\\/]$/, '');
+    try {
+      const gitRoot = await findGitRoot(chosen);
+      state.repoRoot = gitRoot;
+      sendJson(res, 200, { repoRoot: gitRoot, name: path.basename(gitRoot) });
+    } catch {
+      sendJson(res, 400, { error: `Not a git repository: ${chosen}` });
+    }
+    return;
+  }
+
+  if (method === 'GET' && pathName === '/api/repos') {
+    sendJson(res, 200, { repos: await listKnownRepos(repoRoot) });
+    return;
+  }
+
+  if (method === 'POST' && pathName === '/api/repo/switch') {
+    const { path: newPath } = await readJson<{ path: string }>(req);
+    const resolved = path.resolve(newPath);
+    // Validate it's a real git repo
+    try {
+      const gitRoot = await findGitRoot(resolved);
+      state.repoRoot = gitRoot;
+      sendJson(res, 200, { repoRoot: gitRoot });
+    } catch {
+      sendJson(res, 400, { error: `Not a git repository: ${resolved}` });
+    }
+    return;
+  }
+
+  if (method === 'GET' && pathName === '/api/repo/tree') {
+    try {
+      const { stdout } = await execFileAsync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], { cwd: repoRoot });
+      const files = stdout.split('\n').filter(Boolean);
+      sendJson(res, 200, { files });
+    } catch {
+      sendJson(res, 500, { error: 'git ls-files failed' });
+    }
+    return;
+  }
+
+  if (method === 'GET' && pathName === '/api/repo/file') {
+    const rel = url.searchParams.get('path') ?? '';
+    const abs = path.resolve(repoRoot, rel);
+    if (!abs.startsWith(repoRoot)) { sendJson(res, 403, { error: 'Forbidden' }); return; }
+    try {
+      const content = await readFile(abs, 'utf8');
+      sendJson(res, 200, { content, path: rel });
+    } catch {
+      sendJson(res, 404, { error: 'Not found' });
+    }
     return;
   }
 
   sendJson(res, 404, { error: 'Not found.' });
+}
+
+async function listKnownRepos(currentRoot: string): Promise<{ path: string; name: string; current: boolean }[]> {
+  const seen = new Set<string>();
+  const repos: { path: string; name: string; current: boolean }[] = [];
+
+  const addRepo = (p: string) => {
+    const resolved = path.resolve(p);
+    if (seen.has(resolved)) return;
+    seen.add(resolved);
+    repos.push({ path: resolved, name: path.basename(resolved), current: resolved === currentRoot });
+  };
+
+  // Always include current repo
+  addRepo(currentRoot);
+
+  // Discover from ~/.claude/projects/ (or %APPDATA%\Claude\projects on Windows)
+  // Dirs are encoded repo paths: leading / removed, remaining / replaced with -
+  const claudeBase = process.platform === 'win32'
+    ? path.join(process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming'), 'Claude')
+    : path.join(os.homedir(), '.claude');
+  const claudeProjects = path.join(claudeBase, 'projects');
+  try {
+    const entries = await readdir(claudeProjects);
+    for (const entry of entries) {
+      const repoPath = '/' + entry.replace(/^-/, '').replace(/-/g, '/');
+      try {
+        await stat(repoPath);
+        addRepo(repoPath);
+      } catch { /* path doesn't exist */ }
+    }
+  } catch { /* no claude projects dir */ }
+
+  // Discover from ~/.codex/sessions/ — subdirs named after repo paths
+  const codexSessions = path.join(os.homedir(), '.codex', 'sessions');
+  try {
+    const entries = await readdir(codexSessions);
+    for (const entry of entries) {
+      const full = path.join(codexSessions, entry);
+      const st = await stat(full).catch(() => null);
+      if (st?.isDirectory()) {
+        // codex session dirs may contain a "workdir" file
+        try {
+          const workdir = (await readFile(path.join(full, 'workdir'), 'utf8')).trim();
+          if (workdir) addRepo(workdir);
+        } catch { /* no workdir file */ }
+      }
+    }
+  } catch { /* no codex sessions dir */ }
+
+  return repos;
 }
 
 async function loadCodexModels(): Promise<{ id: string; label: string }[]> {
@@ -269,7 +422,7 @@ async function loadCodexModels(): Promise<{ id: string; label: string }[]> {
   }
 }
 
-async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: string, model?: string) {
+async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: string, model?: string, sessionId?: string, onChunk?: (text: string) => void, signal?: AbortSignal) {
   const config = await loadConfig(repoRoot);
   const [diff, comments] = await Promise.all([
     getDiffResponse(repoRoot, config),
@@ -278,16 +431,21 @@ async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: strin
   const { systemPrompt, userMessage } = buildAgentInput(diff, comments, customMessage);
 
   let command = kind === 'codex' ? config.codexCommand : config.claudeCommand;
-  if (model) command = `${command} --model ${model}`;
 
-  // Claude supports --system-prompt so context stays out of the user message.
-  // Codex exec doesn't, so concatenate for that case.
   if (kind === 'claude') {
-    command = `${command} --system-prompt ${JSON.stringify(systemPrompt)}`;
-    return runAgentCommand(command, userMessage, repoRoot);
+    if (sessionId?.startsWith('claude:')) {
+      // Resume: don't add --model or --system-prompt, they conflict with resume
+      command = `${command} --resume ${sessionId.slice(7)}`;
+    } else {
+      if (model) command = `${command} --model ${model}`;
+      command = `${command} --system-prompt ${JSON.stringify(systemPrompt)}`;
+    }
+    console.error('[PatchRelay] claude command:', command);
+    return runAgentCommand(command, userMessage, repoRoot, onChunk, signal);
   } else {
+    if (model) command = `${command} --model ${model}`;
     const fullPrompt = [systemPrompt, '', userMessage].filter(Boolean).join('\n');
-    return runAgentCommand(command, fullPrompt, repoRoot);
+    return runAgentCommand(command, fullPrompt, repoRoot, onChunk, signal);
   }
 }
 

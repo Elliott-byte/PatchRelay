@@ -61,7 +61,7 @@ async function listCodexSessions(repoRoot: string): Promise<SessionListItem[]> {
       return {
         id: `codex:${threadId}`,
         source: 'codex',
-        title: `Codex — ${threadId.slice(0, 8)}…`,
+        title: `Codex — ${threadId}`,
         updatedAt: updatedAt ?? fileStat.mtime.toISOString(),
         messageCount,
       };
@@ -183,7 +183,7 @@ async function listClaudeSessions(repoRoot: string): Promise<SessionListItem[]> 
       return {
         id: `claude:${sessionId}`,
         source: 'claude',
-        title: session.threadName ?? `Claude — ${sessionId.slice(0, 8)}…`,
+        title: session.threadName ?? `Claude — ${sessionId}`,
         updatedAt: session.updatedAt ?? fileStat.mtime.toISOString(),
         messageCount: session.messages.length,
       };

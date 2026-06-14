@@ -1,6 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import type { SyntaxHighlighterProps } from 'react-syntax-highlighter';
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import CodeMirror from '@uiw/react-codemirror';
+import { oneDark as cmOneDark } from '@codemirror/theme-one-dark';
+import { javascript } from '@codemirror/lang-javascript';
+import { python } from '@codemirror/lang-python';
+import { rust } from '@codemirror/lang-rust';
+import { go } from '@codemirror/lang-go';
+import { java } from '@codemirror/lang-java';
+import { css } from '@codemirror/lang-css';
+import { html } from '@codemirror/lang-html';
+import { json } from '@codemirror/lang-json';
+import { markdown } from '@codemirror/lang-markdown';
+import { sql } from '@codemirror/lang-sql';
+import type { Extension } from '@codemirror/state';
 
 type DiffSource = 'staged' | 'unstaged' | 'untracked';
 type DiffLineType = 'context' | 'add' | 'remove' | 'meta';
@@ -8,7 +24,7 @@ type CommentSide = 'old' | 'new';
 type CommentSeverity = 'note' | 'bug' | 'question' | 'nit';
 type CommentStatus = 'open' | 'resolved';
 type AgentKind = 'codex' | 'claude';
-type ActiveTab = 'files' | 'comments' | 'prompt';
+type ActiveTab = 'files' | 'comments' | 'prompt' | `file:${string}`;
 
 interface DiffLine { id: string; type: DiffLineType; raw: string; content: string; oldLine?: number; newLine?: number; }
 interface DiffHunk { id: string; header: string; oldStart: number; oldLines: number; newStart: number; newLines: number; lines: DiffLine[]; }
@@ -37,6 +53,10 @@ export function App() {
   const [editSeverity, setEditSeverity] = useState<CommentSeverity>('bug');
   const [promptPreview, setPromptPreview] = useState('');
   const [agentOutput, setAgentOutput] = useState('');
+  const [streamingText, setStreamingText] = useState('');
+  const [agentRunning, setAgentRunning] = useState(false);
+  const [pendingUserMessage, setPendingUserMessage] = useState('');
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [sessionList, setSessionList] = useState<SessionListItem[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>();
   const [activeSession, setActiveSession] = useState<CodexSessionResponse | undefined>();
@@ -55,6 +75,38 @@ export function App() {
     () => (localStorage.getItem('pr-theme') as 'dark' | 'light') ?? 'dark'
   );
   const [showSession, setShowSession] = useState(true);
+  const [repoList, setRepoList] = useState<{ path: string; name: string; current: boolean }[]>([]);
+  const [leftTab, setLeftTab] = useState<'files' | 'explorer'>('files');
+  const [openFileTabs, setOpenFileTabs] = useState<{ path: string; content: string }[]>([]);
+  const [leftWidth, setLeftWidth] = useState(220);
+  const [rightWidth, setRightWidth] = useState(320);
+  const workspaceRef = useRef<HTMLElement>(null);
+
+  function startDrag(side: 'left' | 'right', e: React.MouseEvent) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startLeft = leftWidth;
+    const startRight = rightWidth;
+    const onMove = (ev: MouseEvent) => {
+      const ws = workspaceRef.current;
+      if (!ws) return;
+      const total = ws.clientWidth;
+      const minL = 140, minC = 300, minR = 220;
+      if (side === 'left') {
+        const next = Math.max(minL, Math.min(startLeft + ev.clientX - startX, total - minC - minR));
+        setLeftWidth(next);
+      } else {
+        const next = Math.max(minR, Math.min(startRight - (ev.clientX - startX), total - minL - minC));
+        setRightWidth(next);
+      }
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
 
   useEffect(() => {
     // Apply persisted theme immediately (before first paint flash)
@@ -63,6 +115,7 @@ export function App() {
     void loadBranches();
     void loadSessionList(true);
     void loadModels('claude');
+    void loadRepos();
   }, []);
 
   useEffect(() => {
@@ -125,16 +178,18 @@ export function App() {
     }
   }
 
-  async function loadSession(id: string) {
-    setSessionLoading(true);
-    setActiveSession(undefined);
+  async function loadSession(id: string, { silent = false }: { silent?: boolean } = {}) {
+    if (!silent) {
+      setSessionLoading(true);
+      setActiveSession(undefined);
+    }
     try {
       const s = await api<CodexSessionResponse>(`/api/sessions/${encodeURIComponent(id)}`);
       setActiveSession(s);
     } catch (e) {
-      setActiveSession({ messages: [], unavailableReason: msgFor(e) });
+      if (!silent) setActiveSession({ messages: [], unavailableReason: msgFor(e) });
     } finally {
-      setSessionLoading(false);
+      if (!silent) setSessionLoading(false);
     }
   }
 
@@ -145,6 +200,37 @@ export function App() {
 
   async function loadBranches() {
     try { setBranches(await api<BranchInfo>('/api/git/branches')); } catch { /* non-critical */ }
+  }
+
+  async function loadRepos() {
+    try {
+      const r = await api<{ repos: { path: string; name: string; current: boolean }[] }>('/api/repos');
+      setRepoList(r.repos);
+    } catch { /* non-critical */ }
+  }
+
+  async function pickRepo() {
+    try {
+      const r = await api<{ repoRoot?: string; name?: string; cancelled?: boolean }>('/api/repo/pick', { method: 'POST' });
+      if (r.cancelled || !r.repoRoot) return;
+      setActiveSessionId(undefined);
+      setActiveSession(undefined);
+      setAgentOutput('');
+      await Promise.all([refresh(true), loadBranches(), loadSessionList(false), loadRepos()]);
+      flash(`Switched to ${r.name ?? r.repoRoot}`);
+    } catch (e) { setError(msgFor(e)); }
+  }
+
+  async function switchRepo(repoPath: string) {
+    try {
+      await api('/api/repo/switch', { method: 'POST', body: JSON.stringify({ path: repoPath }) });
+      // Full reset — new repo means new diff, comments, sessions, branches
+      setActiveSessionId(undefined);
+      setActiveSession(undefined);
+      setAgentOutput('');
+      await Promise.all([refresh(true), loadBranches(), loadSessionList(false), loadRepos()]);
+      flash(`Switched to ${repoPath.split('/').pop()}`);
+    } catch (e) { setError(msgFor(e)); }
   }
 
   async function loadModels(provider: AgentKind) {
@@ -257,27 +343,110 @@ export function App() {
   }
 
   async function sendToAgent(kind: AgentKind, customMessage?: string) {
+    if (!customMessage?.trim() && openComments.length === 0) return;
     setBusy(true);
-    setAgentOutput('');
+    setAgentRunning(true);
+    setStreamingText('');
+    setPendingUserMessage(customMessage ?? '');
+    const resumingId = activeSessionId;
+    const ac = new AbortController();
+    abortControllerRef.current = ac;
     try {
-      const r = await api<{ success: boolean; command: string; stdout: string; stderr: string; error?: string }>(
-        `/api/agent/${kind}`,
-        { method: 'POST', body: JSON.stringify({ message: customMessage, model: activeModel }) }
-      );
-      setAgentOutput(
-        [r.error ? `Error: ${r.error}` : '', r.stdout, r.stderr ? `stderr:\n${r.stderr}` : '']
-          .filter(Boolean).join('\n\n')
-      );
+      const res = await fetch(`/api/agent/${kind}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: customMessage, model: activeModel, sessionId: resumingId }),
+        signal: ac.signal,
+      });
+      if (!res.ok || !res.body) {
+        const data = await res.json() as { error?: string };
+        setError(data.error ?? `Request failed: ${res.status}`);
+        return;
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      outer: while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const event = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          for (const line of event.split('\n')) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const data = JSON.parse(line.slice(6)) as { type: string; text?: string; error?: string };
+              if (data.type === 'chunk' && data.text) {
+                console.log('[stream] chunk', data.text.length, 'bytes');
+                setStreamingText(prev => prev + data.text);
+              } else if (data.type === 'done') {
+                if (data.error) setError(data.error);
+                break outer;
+              }
+            } catch { /* malformed event */ }
+          }
+        }
+      }
       const [, sessionsResp] = await Promise.all([
         refresh(false),
         api<{ sessions: SessionListItem[] }>('/api/sessions'),
       ]);
       setSessionList(sessionsResp.sessions);
-      // auto-select the newest session for this provider
-      const latest = sessionsResp.sessions.filter(s => s.source === kind)[0];
-      if (latest) { setActiveSessionId(latest.id); void loadSession(latest.id); }
-    } catch (e) { setError(msgFor(e)); }
-    finally { setBusy(false); }
+      if (resumingId) {
+        await loadSession(resumingId);
+      } else {
+        const latest = sessionsResp.sessions.filter(s => s.source === kind)[0];
+        if (latest) { setActiveSessionId(latest.id); await loadSession(latest.id); }
+      }
+      setStreamingText('');
+    } catch (e) {
+      if (e instanceof Error && e.name === 'AbortError') { /* user cancelled, silent */ }
+      else setError(msgFor(e));
+      setStreamingText(''); setPendingUserMessage('');
+    }
+    finally { abortControllerRef.current = null; setBusy(false); setAgentRunning(false); setPendingUserMessage(''); }
+  }
+
+  function stopAgent() {
+    abortControllerRef.current?.abort();
+    // Give the server ~600ms to flush its final output, then reload
+    const snapId = activeSessionId;
+    setTimeout(() => {
+      void (async () => {
+        await loadSessionList(false);
+        if (snapId) await loadSession(snapId, { silent: true });
+      })();
+    }, 600);
+  }
+
+  async function openFileTab(filePath: string) {
+    const tabId: ActiveTab = `file:${filePath}`;
+    if (openFileTabs.find(t => t.path === filePath)) {
+      setActiveTab(tabId);
+      return;
+    }
+    try {
+      const data = await api<{ content: string; path: string }>(`/api/repo/file?path=${encodeURIComponent(filePath)}`);
+      setOpenFileTabs(prev => [...prev, { path: filePath, content: data.content }]);
+      setActiveTab(tabId);
+    } catch (e) {
+      setError(msgFor(e));
+    }
+  }
+
+  function closeFileTab(filePath: string) {
+    setOpenFileTabs(prev => {
+      const next = prev.filter(t => t.path !== filePath);
+      const tabId: ActiveTab = `file:${filePath}`;
+      if (activeTab === tabId) {
+        const idx = prev.findIndex(t => t.path === filePath);
+        const neighbour = next[idx] ?? next[idx - 1];
+        setActiveTab(neighbour ? `file:${neighbour.path}` : 'files');
+      }
+      return next;
+    });
   }
 
   function newSession() {
@@ -303,7 +472,12 @@ export function App() {
       {/* ── Header ── */}
       <header className="app-header">
         <div className="header-brand">
-          <span className="header-repo">{repoName}</span>
+          <RepoSelector
+            repos={repoList}
+            currentName={repoName}
+            onSwitch={(p) => void switchRepo(p)}
+            onPick={() => void pickRepo()}
+          />
           <BranchSelector
             current={currentBranch}
             branches={branches?.branches ?? [currentBranch]}
@@ -330,16 +504,16 @@ export function App() {
         </nav>
 
         <div className="header-actions">
-          <button className="hbtn" onClick={() => void refresh(true)} disabled={busy} title="Refresh">↺</button>
+          <button className="hbtn hbtn-icon" onClick={() => void refresh(true)} disabled={busy} title="Refresh">↺</button>
           <button
-            className={`hbtn${showSession ? ' active' : ''}`}
+            className={`hbtn hbtn-icon${showSession ? ' active' : ''}`}
             onClick={() => setShowSession(s => !s)}
             title="Toggle session panel"
           >
             ☰
           </button>
           <button
-            className="hbtn theme-toggle"
+            className="hbtn hbtn-icon theme-toggle"
             onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
             title="Toggle light/dark"
           >
@@ -353,49 +527,70 @@ export function App() {
       {successMsg ? <div className="flash flash-success">{successMsg}</div> : null}
 
       {/* ── Workspace ── */}
-      <section className={`workspace${showSession ? '' : ' session-hidden'}`}>
+      <section
+        className={`workspace${showSession ? '' : ' session-hidden'}`}
+        ref={workspaceRef}
+        style={showSession
+          ? { gridTemplateColumns: `${leftWidth}px 4px minmax(0,1fr) 4px ${rightWidth}px` }
+          : { gridTemplateColumns: `${leftWidth}px 4px minmax(0,1fr)` }}
+      >
 
-        {/* Left: files + commit */}
+        {/* Left sidebar */}
         <aside className="file-sidebar" aria-label="Changed files">
-          <div className="sidebar-heading">
-            <span>Files</span>
-            <span className="count-badge">{totalStats.files}</span>
-          </div>
-          <div className="file-list">
-            {diff?.files.length ? diff.files.map((file) => {
-              const fs = getFileStats(file);
-              const fc = comments.filter((c) => commentMatchesFile(c, file));
-              const isActive = file.id === selectedFile?.id;
-              return (
-                <div key={file.id} className={`file-row${isActive ? ' active' : ''}`}>
-                  <button className="file-row-label" onClick={() => { setSelectedFileId(file.id); setActiveTab('files'); }}>
-                    <span className="file-name">{displayPath(file)}</span>
-                    <span className="file-meta">
-                      <span className={`src-badge src-${file.source}`}>{sourceLabel(file.source)}</span>
-                      <span className="adds">+{fs.additions}</span>
-                      <span className="dels">−{fs.deletions}</span>
-                      {fc.length ? <span className="comment-count">💬 {fc.length}</span> : null}
-                    </span>
-                  </button>
-                  <button
-                    className={`stage-btn ${file.source === 'staged' ? 'unstage' : 'stage'}`}
-                    title={file.source === 'staged' ? 'Unstage' : 'Stage'}
-                    onClick={() => file.source === 'staged' ? void unstageFile(file) : void stageFile(file)}
-                  >
-                    {file.source === 'staged' ? '−' : '+'}
-                  </button>
-                </div>
-              );
-            }) : <p className="empty-hint">No local diff.</p>}
-          </div>
-          <div className="commit-panel">
-            <textarea className="commit-input" value={commitMessage} onChange={(e) => setCommitMessage(e.target.value)} placeholder="Commit message…" rows={3} />
-            <button className="commit-btn" onClick={() => void commit()} disabled={busy || !commitMessage.trim() || !hasStagedChanges}>
-              Commit staged
+          {/* Tab bar */}
+          <div className="left-tab-bar">
+            <button className={`left-tab${leftTab === 'files' ? ' active' : ''}`} onClick={() => setLeftTab('files')}>
+              Files <span className="count-badge">{totalStats.files}</span>
             </button>
-            {!hasStagedChanges && !!diff?.files.length && <p className="commit-hint">Stage files to commit.</p>}
+            <button className={`left-tab${leftTab === 'explorer' ? ' active' : ''}`} onClick={() => setLeftTab('explorer')}>
+              Explorer
+            </button>
           </div>
+
+          {leftTab === 'files' && (
+            <>
+              <div className="file-list">
+                {diff?.files.length ? diff.files.map((file) => {
+                  const fs = getFileStats(file);
+                  const fc = comments.filter((c) => commentMatchesFile(c, file));
+                  const isActive = file.id === selectedFile?.id;
+                  return (
+                    <div key={file.id} className={`file-row${isActive ? ' active' : ''}`}>
+                      <button className="file-row-label" onClick={() => { setSelectedFileId(file.id); setActiveTab('files'); }}>
+                        <span className="file-name">{displayPath(file)}</span>
+                        <span className="file-meta">
+                          <span className={`src-badge src-${file.source}`}>{sourceLabel(file.source)}</span>
+                          <span className="adds">+{fs.additions}</span>
+                          <span className="dels">−{fs.deletions}</span>
+                          {fc.length ? <span className="comment-count">💬 {fc.length}</span> : null}
+                        </span>
+                      </button>
+                      <button
+                        className={`stage-btn ${file.source === 'staged' ? 'unstage' : 'stage'}`}
+                        title={file.source === 'staged' ? 'Unstage' : 'Stage'}
+                        onClick={() => file.source === 'staged' ? void unstageFile(file) : void stageFile(file)}
+                      >
+                        {file.source === 'staged' ? '−' : '+'}
+                      </button>
+                    </div>
+                  );
+                }) : <p className="empty-hint">No local diff.</p>}
+              </div>
+              <div className="commit-panel">
+                <textarea className="commit-input" value={commitMessage} onChange={(e) => setCommitMessage(e.target.value)} placeholder="Commit message…" rows={3} />
+                <button className="commit-btn" onClick={() => void commit()} disabled={busy || !commitMessage.trim() || !hasStagedChanges}>
+                  Commit staged
+                </button>
+                {!hasStagedChanges && !!diff?.files.length && <p className="commit-hint">Stage files to commit.</p>}
+              </div>
+            </>
+          )}
+
+          {leftTab === 'explorer' && (
+            <RepoExplorer repoRoot={diff?.repo.repoRoot ?? ''} onOpenFile={(p) => void openFileTab(p)} />
+          )}
         </aside>
+        <div className="pane-divider" onMouseDown={(e) => startDrag('left', e)} />
 
         {/* Center: diff + floating chat */}
         <section className="center-pane" aria-label="Main panel">
@@ -451,7 +646,7 @@ export function App() {
             )}
           </div>
 
-          {/* Floating chat compose */}
+          {/* Floating chat compose — inside center-content so it doesn't overlay the file editor */}
           <FloatingCompose
             busy={busy}
             openComments={openComments}
@@ -461,9 +656,10 @@ export function App() {
             onSend={(msg) => void sendToAgent(activeProvider, msg)}
           />
         </section>
+        {showSession && <div className="pane-divider" onMouseDown={(e) => startDrag('right', e)} />}
 
         {/* Right: session browser */}
-        <aside className="session-sidebar" aria-label="Agent session">
+        {showSession && <aside className="session-sidebar" aria-label="Agent session">
           <SessionPanel
             sessions={sessionList}
             activeSessionId={activeSessionId}
@@ -472,6 +668,10 @@ export function App() {
             activeProvider={activeProvider}
             activeModel={activeModel}
             modelList={modelList}
+            streamingText={streamingText}
+            agentRunning={agentRunning}
+            pendingUserMessage={pendingUserMessage}
+            onStop={stopAgent}
             onProviderChange={(p) => {
               setActiveProvider(p);
               void loadModels(p);
@@ -487,14 +687,71 @@ export function App() {
             onModelChange={setActiveModel}
             onSelectSession={selectSession}
             onNewSession={() => void newSession()}
+            onRefresh={() => { if (activeSessionId) void loadSession(activeSessionId, { silent: true }); }}
           />
-        </aside>
+        </aside>}
       </section>
     </main>
   );
 }
 
 // ── Branch selector ───────────────────────────────────────────────────────────
+
+// ── Repo selector ─────────────────────────────────────────────────────────────
+
+function RepoSelector({ repos, currentName, onSwitch, onPick }: {
+  repos: { path: string; name: string; current: boolean }[];
+  currentName: string;
+  onSwitch: (path: string) => void;
+  onPick: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  return (
+    <div className="repo-selector" ref={ref}>
+      <button className="repo-btn" onClick={() => setOpen(o => !o)}>
+        <svg viewBox="0 0 16 16" fill="currentColor" width="13" height="13">
+          <path d="M2 2.5A2.5 2.5 0 014.5 0h8.75a.75.75 0 010 1.5H4.5a1 1 0 00-1 1v10.5a1 1 0 001 1h8.75a.75.75 0 010 1.5H4.5A2.5 2.5 0 012 13V2.5zm4.75 3.25a.75.75 0 000 1.5h4.5a.75.75 0 000-1.5h-4.5zm0 3a.75.75 0 000 1.5h4.5a.75.75 0 000-1.5h-4.5z"/>
+        </svg>
+        <span className="repo-btn-name">{currentName}</span>
+        <svg viewBox="0 0 10 6" fill="currentColor" width="8" height="8" style={{ opacity: 0.5 }}>
+          <path d="M0 0l5 6 5-6z"/>
+        </svg>
+      </button>
+      {open && (
+        <div className="repo-dropdown">
+          {repos.map(r => (
+            <button
+              key={r.path}
+              className={`repo-item${r.current ? ' active' : ''}`}
+              onClick={() => { if (!r.current) onSwitch(r.path); setOpen(false); }}
+              title={r.path}
+            >
+              <span className="repo-item-name">{r.name}</span>
+              {r.current && <span className="repo-item-check">✓</span>}
+            </button>
+          ))}
+          <div className="repo-divider" />
+          <button className="repo-item repo-add" onClick={() => { onPick(); setOpen(false); }}>
+            + Add repository…
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Branch selector ────────────────────────────────────────────────────────────
 
 interface BranchSelectorProps {
   current: string;
@@ -624,11 +881,21 @@ interface FloatingComposeProps {
 
 function FloatingCompose(props: FloatingComposeProps) {
   const [msg, setMsg] = useState('');
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const label = props.activeProvider === 'codex' ? 'Codex' : 'Claude Code';
 
+  function resizeTextarea(el: HTMLTextAreaElement) {
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  }
+
   function handleSend() {
+    if (!msg.trim() && props.openComments.length === 0) return;
     props.onSend(msg);
     setMsg('');
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+    }
   }
 
   const grouped = Object.entries(
@@ -666,18 +933,16 @@ function FloatingCompose(props: FloatingComposeProps) {
       )}
       <div className="chat-float-input-row">
         <textarea
+          ref={textareaRef}
           className="chat-float-input"
           value={msg}
-          onChange={(e) => setMsg(e.target.value)}
+          onChange={(e) => { setMsg(e.target.value); resizeTextarea(e.target); }}
           placeholder={`Ask ${label} to edit your code…`}
-          rows={2}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); handleSend(); }
           }}
         />
-        <button className="chat-float-send" disabled={props.busy} onClick={handleSend}>
-          {props.busy ? '…' : '↑'}
-        </button>
+        <button className="chat-float-send" disabled={props.busy || (!msg.trim() && props.openComments.length === 0)} onClick={handleSend}>↑</button>
       </div>
     </div>
   );
@@ -788,10 +1053,15 @@ interface SessionPanelProps {
   activeProvider: AgentKind;
   activeModel: string;
   modelList: { id: string; label: string }[];
+  streamingText: string;
+  agentRunning: boolean;
+  pendingUserMessage: string;
+  onStop: () => void;
   onProviderChange: (p: AgentKind) => void;
   onModelChange: (m: string) => void;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
+  onRefresh: () => void;
 }
 
 function SessionPanel(props: SessionPanelProps) {
@@ -800,10 +1070,33 @@ function SessionPanel(props: SessionPanelProps) {
   const activeItem = props.sessions.find((s) => s.id === props.activeSessionId);
   const filtered = props.sessions.filter(s => s.source === props.activeProvider);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const userScrolledUpRef = useRef(false);
 
+  // Detect manual scroll up
   useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      userScrolledUpRef.current = distFromBottom > 80;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
+
+  // Auto-scroll to bottom unless user scrolled up
+  useEffect(() => {
+    if (!userScrolledUpRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'instant' });
+    }
+  }, [messages.length, props.activeSessionId, props.streamingText, props.agentRunning]);
+
+  // When session changes, always scroll to bottom and reset flag
+  useEffect(() => {
+    userScrolledUpRef.current = false;
     bottomRef.current?.scrollIntoView({ behavior: 'instant' });
-  }, [messages.length, props.activeSessionId]);
+  }, [props.activeSessionId]);
 
   return (
     <div className="session-panel">
@@ -823,6 +1116,7 @@ function SessionPanel(props: SessionPanelProps) {
           onChange={props.onModelChange}
           placeholder="Model"
         />
+        <button className="new-session-btn" onClick={props.onRefresh} title="Refresh session" disabled={props.sessionLoading}>↻</button>
         <button className="new-session-btn" onClick={props.onNewSession} title="New session">+</button>
       </div>
 
@@ -850,16 +1144,42 @@ function SessionPanel(props: SessionPanelProps) {
       )}
 
       {/* Messages — oldest first, scroll to bottom, grouped by consecutive role */}
-      <div className="session-messages">
+      <div className="session-messages" ref={scrollContainerRef}>
         {props.sessionLoading ? (
           <div className="session-unavailable">Loading…</div>
         ) : session?.unavailableReason ? (
           <div className="session-unavailable">{session.unavailableReason}</div>
-        ) : messages.length ? (
+        ) : messages.length || props.agentRunning || props.streamingText ? (
           <>
             {groupMessages(messages).map((group) => (
               <MessageBubble key={group[0].id} msgs={group} source={activeItem?.source} />
             ))}
+            {props.pendingUserMessage && (
+              <div className="msg msg-user">
+                <div className="msg-header">
+                  <span className="msg-role">You</span>
+                </div>
+                <div className="msg-body"><span className="msg-plain">{props.pendingUserMessage}</span></div>
+              </div>
+            )}
+            {(props.agentRunning || props.streamingText) && (
+              <div className="msg msg-assistant msg-streaming">
+                <div className="msg-header">
+                  <span className="msg-role">{props.activeProvider === 'claude' ? 'Claude' : 'Codex'}</span>
+                  <span className="msg-time">…</span>
+                </div>
+                <div className="msg-body">
+                  {props.streamingText
+                    ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{props.streamingText}</ReactMarkdown>
+                    : <span className="thinking-dots"><span/><span/><span/></span>}
+                </div>
+              </div>
+            )}
+            {props.agentRunning && (
+              <div className="msg-stop-row">
+                <button className="msg-stop-btn" onClick={props.onStop}>■ Stop</button>
+              </div>
+            )}
             <div ref={bottomRef} />
           </>
         ) : props.sessions.length === 0 ? (
@@ -927,6 +1247,183 @@ function CommentsTab(props: CommentsTabProps) {
   );
 }
 
+// ── Repo Explorer ─────────────────────────────────────────────────────────────
+
+
+interface FsNode { name: string; path: string; isDir: false }
+interface FsDir  { name: string; path: string; isDir: true; children: Map<string, FsNode | FsDir> }
+
+function buildTree(files: string[]): FsDir {
+  const root: FsDir = { name: '', path: '', isDir: true, children: new Map() };
+  for (const f of files) {
+    const parts = f.split('/');
+    let node: FsDir = root;
+    for (let i = 0; i < parts.length; i++) {
+      const name = parts[i];
+      const path = parts.slice(0, i + 1).join('/');
+      const isLast = i === parts.length - 1;
+      if (isLast) {
+        node.children.set(name, { name, path, isDir: false });
+      } else {
+        if (!node.children.has(name)) {
+          node.children.set(name, { name, path, isDir: true, children: new Map() });
+        }
+        node = node.children.get(name) as FsDir;
+      }
+    }
+  }
+  return root;
+}
+
+function sortedChildren(dir: FsDir): (FsNode | FsDir)[] {
+  return [...dir.children.values()].sort((a, b) =>
+    a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1
+  );
+}
+
+function RepoExplorer({ repoRoot, onOpenFile }: { repoRoot: string; onOpenFile: (path: string) => void }) {
+  const [tree, setTree] = useState<FsDir | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!repoRoot) return;
+    setLoading(true);
+    api<{ files: string[] }>('/api/repo/tree')
+      .then(d => setTree(buildTree(d.files)))
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [repoRoot]);
+
+  const toggle = (node: FsNode | FsDir) => {
+    if (!node.isDir) { onOpenFile(node.path); return; }
+    setExpanded(prev => {
+      const s = new Set(prev);
+      s.has(node.path) ? s.delete(node.path) : s.add(node.path);
+      return s;
+    });
+  };
+
+  const renderDir = (dir: FsDir, depth: number): React.ReactNode =>
+    sortedChildren(dir).map(node => (
+      <div key={node.path}>
+        <button
+          className={`explorer-row${node.isDir ? ' explorer-dir' : ''}`}
+          style={{ paddingLeft: depth * 14 + 8 }}
+          onClick={() => toggle(node)}
+        >
+          <span className="explorer-icon">
+            {node.isDir ? (expanded.has(node.path) ? '▾' : '▸') : '·'}
+          </span>
+          <span className="explorer-name">{node.name}</span>
+        </button>
+        {node.isDir && expanded.has(node.path) && renderDir(node as FsDir, depth + 1)}
+      </div>
+    ));
+
+  if (loading) return <div className="explorer-loading" style={{ padding: 12 }}>Loading…</div>;
+  if (!tree) return null;
+  return <div className="explorer-tree">{renderDir(tree, 0)}</div>;
+}
+
+function FileEditor({ path, content, onChange }: { path: string; content: string; onChange: (v: string) => void }) {
+  const extensions = useMemo(() => cmLanguage(path), [path]);
+  return (
+    <CodeMirror
+      value={content}
+      extensions={extensions}
+      theme={cmOneDark}
+      onChange={onChange}
+      style={{ height: '100%', fontSize: 13 }}
+      height="100%"
+    />
+  );
+}
+
+// ── Syntax-highlighted hunk ───────────────────────────────────────────────────
+
+interface HighlightedHunkProps {
+  hunk: DiffHunk; file: DiffFile; comments: ReviewComment[]; activeTarget?: CommentTarget;
+  draftComment: string; draftSeverity: CommentSeverity; editingId?: string;
+  editComment: string; editSeverity: CommentSeverity;
+  onStartComment: (t: CommentTarget) => void; onCancelDraft: () => void;
+  onDraftCommentChange: (v: string) => void; onDraftSeverityChange: (v: CommentSeverity) => void;
+  onSaveDraft: () => void; onEdit: (c: ReviewComment) => void;
+  onEditCommentChange: (v: string) => void; onEditSeverityChange: (v: CommentSeverity) => void;
+  onCancelEdit: () => void; onSaveEdit: (id: string) => void;
+  onResolve: (c: ReviewComment) => void; onReopen: (c: ReviewComment) => void;
+  onDelete: (c: ReviewComment) => void;
+}
+
+function HighlightedHunk(props: HighlightedHunkProps) {
+  const { hunk, file } = props;
+  const lang = detectLanguage(displayPath(file));
+  const code = hunk.lines.map(l => l.content).join('\n');
+
+  const renderer: SyntaxHighlighterProps['renderer'] = ({ rows, stylesheet, useInlineStyles }) => {
+    return (
+      <div className="hunk">
+        <div className="hunk-header"><span /><span /><span /><code>{hunk.header}</code></div>
+        {hunk.lines.map((line, i) => {
+          const target = commentTargetForLine(file, hunk, line);
+          const lineComments = target ? props.comments.filter((c) => sameCommentLocation(c, target)) : [];
+          const draftHere = target && props.activeTarget ? sameCommentLocation(props.activeTarget, target) : false;
+          const row = rows[i];
+          return (
+            <div className="line-block" key={line.id}>
+              <div className={`diff-line diff-${line.type}`}>
+                <div className="ln old">{line.oldLine ?? ''}</div>
+                <div className="ln new">{line.newLine ?? ''}</div>
+                <div className="line-action">
+                  {target && <button className="comment-btn" title="Add comment" onClick={() => props.onStartComment(target)}>+</button>}
+                </div>
+                <pre>
+                  <span className="diff-pfx">{prefixFor(line)}</span>
+                  {row ? row.children?.map((token: any, j: number) => {
+                    const style = useInlineStyles && token.properties?.style
+                      ? (typeof token.properties.style === 'object' ? token.properties.style : {})
+                      : {};
+                    const cls = (!useInlineStyles && token.properties?.className)
+                      ? (Array.isArray(token.properties.className) ? token.properties.className.join(' ') : token.properties.className)
+                      : undefined;
+                    return <span key={j} style={style} className={cls}>{token.children?.[0]?.value ?? ''}</span>;
+                  }) : line.content}
+                </pre>
+              </div>
+              {lineComments.map((c) => (
+                <ReviewCommentItem key={c.id} comment={c}
+                  isEditing={props.editingId === c.id} editComment={props.editComment} editSeverity={props.editSeverity}
+                  onEdit={() => props.onEdit(c)} onEditCommentChange={props.onEditCommentChange}
+                  onEditSeverityChange={props.onEditSeverityChange} onCancelEdit={props.onCancelEdit}
+                  onSaveEdit={() => props.onSaveEdit(c.id)} onResolve={() => props.onResolve(c)}
+                  onReopen={() => props.onReopen(c)} onDelete={() => props.onDelete(c)} />
+              ))}
+              {draftHere && (
+                <CommentEditor comment={props.draftComment} severity={props.draftSeverity}
+                  onCommentChange={props.onDraftCommentChange} onSeverityChange={props.onDraftSeverityChange}
+                  onCancel={props.onCancelDraft} onSave={props.onSaveDraft} saveLabel="Comment" />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  return (
+    <SyntaxHighlighter
+      language={lang}
+      style={oneDark}
+      renderer={renderer}
+      PreTag="div"
+      useInlineStyles
+      customStyle={{ display: 'contents', background: 'none' }}
+    >
+      {code}
+    </SyntaxHighlighter>
+  );
+}
+
 // ── Diff viewer ───────────────────────────────────────────────────────────────
 
 interface DiffViewerProps {
@@ -961,41 +1458,31 @@ function DiffViewer(props: DiffViewerProps) {
       </div>
 
       {props.file.hunks.map((hunk) => (
-        <div className="hunk" key={hunk.id}>
-          <div className="hunk-header"><span /><span /><span /><code>{hunk.header}</code></div>
-          {hunk.lines.map((line) => {
-            const target = commentTargetForLine(props.file, hunk, line);
-            const lineComments = target ? props.comments.filter((c) => sameCommentLocation(c, target)) : [];
-            const draftHere = target && props.activeTarget ? sameCommentLocation(props.activeTarget, target) : false;
-            return (
-              <div className="line-block" key={line.id}>
-                <div className={`diff-line diff-${line.type}`}>
-                  <div className="ln old">{line.oldLine ?? ''}</div>
-                  <div className="ln new">{line.newLine ?? ''}</div>
-                  <div className="line-action">
-                    {target ? (
-                      <button className="comment-btn" title="Add comment" onClick={() => props.onStartComment(target)}>+</button>
-                    ) : null}
-                  </div>
-                  <pre><span className="diff-pfx">{prefixFor(line)}</span>{line.content}</pre>
-                </div>
-                {lineComments.map((c) => (
-                  <ReviewCommentItem key={c.id} comment={c}
-                    isEditing={props.editingId === c.id} editComment={props.editComment} editSeverity={props.editSeverity}
-                    onEdit={() => props.onEdit(c)} onEditCommentChange={props.onEditCommentChange}
-                    onEditSeverityChange={props.onEditSeverityChange} onCancelEdit={props.onCancelEdit}
-                    onSaveEdit={() => props.onSaveEdit(c.id)} onResolve={() => props.onResolve(c)}
-                    onReopen={() => props.onReopen(c)} onDelete={() => props.onDelete(c)} />
-                ))}
-                {draftHere && (
-                  <CommentEditor comment={props.draftComment} severity={props.draftSeverity}
-                    onCommentChange={props.onDraftCommentChange} onSeverityChange={props.onDraftSeverityChange}
-                    onCancel={props.onCancelDraft} onSave={props.onSaveDraft} saveLabel="Comment" />
-                )}
-              </div>
-            );
-          })}
-        </div>
+        <HighlightedHunk
+          key={hunk.id}
+          hunk={hunk}
+          file={props.file}
+          comments={props.comments}
+          activeTarget={props.activeTarget}
+          editingId={props.editingId}
+          editComment={props.editComment}
+          editSeverity={props.editSeverity}
+          draftComment={props.draftComment}
+          draftSeverity={props.draftSeverity}
+          onStartComment={props.onStartComment}
+          onEdit={props.onEdit}
+          onEditCommentChange={props.onEditCommentChange}
+          onEditSeverityChange={props.onEditSeverityChange}
+          onCancelEdit={props.onCancelEdit}
+          onSaveEdit={props.onSaveEdit}
+          onResolve={props.onResolve}
+          onReopen={props.onReopen}
+          onDelete={props.onDelete}
+          onDraftCommentChange={props.onDraftCommentChange}
+          onDraftSeverityChange={props.onDraftSeverityChange}
+          onCancelDraft={props.onCancelDraft}
+          onSaveDraft={props.onSaveDraft}
+        />
       ))}
     </div>
   );
@@ -1132,6 +1619,41 @@ function formatDate(value: string): string {
   try {
     return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(value));
   } catch { return value; }
+}
+
+const EXT_LANG: Record<string, string> = {
+  ts: 'typescript', tsx: 'tsx', js: 'javascript', jsx: 'jsx',
+  json: 'json', css: 'css', scss: 'scss', less: 'less',
+  html: 'html', xml: 'xml', svg: 'svg',
+  py: 'python', rb: 'ruby', go: 'go', rs: 'rust',
+  java: 'java', kt: 'kotlin', swift: 'swift', c: 'c', cpp: 'cpp', cs: 'csharp',
+  sh: 'bash', zsh: 'bash', bash: 'bash', fish: 'bash',
+  md: 'markdown', yaml: 'yaml', yml: 'yaml', toml: 'toml',
+  sql: 'sql', graphql: 'graphql', proto: 'protobuf',
+  dockerfile: 'docker', makefile: 'makefile',
+};
+
+function cmLanguage(filename: string): Extension[] {
+  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+  if (['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs'].includes(ext)) return [javascript({ jsx: true, typescript: true })];
+  if (ext === 'py') return [python()];
+  if (ext === 'rs') return [rust()];
+  if (ext === 'go') return [go()];
+  if (['java', 'kt'].includes(ext)) return [java()];
+  if (['css', 'scss', 'less'].includes(ext)) return [css()];
+  if (['html', 'htm', 'xml', 'svg'].includes(ext)) return [html()];
+  if (ext === 'json') return [json()];
+  if (['md', 'mdx'].includes(ext)) return [markdown()];
+  if (ext === 'sql') return [sql()];
+  return [];
+}
+
+function detectLanguage(filename: string): string {
+  const base = filename.split('/').pop() ?? filename;
+  if (base.toLowerCase() === 'dockerfile') return 'docker';
+  if (base.toLowerCase() === 'makefile') return 'makefile';
+  const ext = base.split('.').pop()?.toLowerCase() ?? '';
+  return EXT_LANG[ext] ?? 'text';
 }
 
 async function api<T = unknown>(url: string, init: RequestInit = {}): Promise<T> {
