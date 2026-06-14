@@ -1,0 +1,392 @@
+import { execFile } from 'node:child_process';
+import { readFile, stat } from 'node:fs/promises';
+import path from 'node:path';
+import { promisify } from 'node:util';
+import type { DiffFile, DiffLine, DiffResponse, DiffSource, PatchRelayConfig, RepoInfo } from './types.js';
+
+const execFileAsync = promisify(execFile);
+const maxUntrackedTextBytes = 512 * 1024;
+
+export async function findGitRoot(startDir = process.cwd()): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['rev-parse', '--show-toplevel'], {
+    cwd: startDir
+  });
+  return stdout.trim();
+}
+
+export async function getRepoInfo(repoRoot: string): Promise<RepoInfo> {
+  const [branchResult] = await Promise.allSettled([
+    execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoRoot })
+  ]);
+  const branch =
+    branchResult.status === 'fulfilled' ? branchResult.value.stdout.trim() || 'unknown' : 'unknown';
+
+  return {
+    repoRoot,
+    repoName: path.basename(repoRoot),
+    branch
+  };
+}
+
+export async function getDiffResponse(
+  repoRoot: string,
+  config: Pick<PatchRelayConfig, 'includeStagedDiff' | 'includeUnstagedDiff'>
+): Promise<DiffResponse> {
+  const diffTasks: Promise<DiffFile[]>[] = [];
+  if (config.includeStagedDiff) {
+    diffTasks.push(getDiffFiles(repoRoot, 'staged'));
+  }
+  if (config.includeUnstagedDiff) {
+    diffTasks.push(getDiffFiles(repoRoot, 'unstaged'));
+    diffTasks.push(getUntrackedDiffFiles(repoRoot));
+  }
+
+  const [repo, diffResults] = await Promise.all([getRepoInfo(repoRoot), Promise.all(diffTasks)]);
+  const files = diffResults.flat();
+  const updatedAt = await getLatestChangedFileTime(repoRoot, files);
+
+  return {
+    repo,
+    files,
+    generatedAt: new Date().toISOString(),
+    updatedAt
+  };
+}
+
+export async function getDiffFiles(repoRoot: string, source: DiffSource): Promise<DiffFile[]> {
+  const args = source === 'staged' ? ['diff', '--cached', '--no-ext-diff'] : ['diff', '--no-ext-diff'];
+  const { stdout } = await execFileAsync('git', args, {
+    cwd: repoRoot,
+    maxBuffer: 20 * 1024 * 1024
+  });
+  return parseUnifiedDiff(stdout, source);
+}
+
+export function parseUnifiedDiff(diff: string, source: DiffSource): DiffFile[] {
+  const normalizedDiff = diff.endsWith('\n') ? diff.slice(0, -1) : diff;
+  if (!normalizedDiff) {
+    return [];
+  }
+
+  const lines = normalizedDiff.split(/\r?\n/);
+  const files: DiffFile[] = [];
+  let currentFile: DiffFile | undefined;
+  let oldLine = 0;
+  let newLine = 0;
+
+  for (const rawLine of lines) {
+    if (rawLine.length === 0 && !currentFile) {
+      continue;
+    }
+
+    const diffGitMatch = rawLine.match(/^diff --git a\/(.+) b\/(.+)$/);
+    if (diffGitMatch) {
+      currentFile = {
+        id: `${source}:${files.length}:${diffGitMatch[1]}:${diffGitMatch[2]}`,
+        source,
+        oldPath: diffGitMatch[1],
+        newPath: diffGitMatch[2],
+        hunks: []
+      };
+      files.push(currentFile);
+      continue;
+    }
+
+    if (!currentFile) {
+      continue;
+    }
+
+    if (rawLine.startsWith('--- ')) {
+      currentFile.oldPath = stripDiffPath(rawLine.slice(4));
+      continue;
+    }
+
+    if (rawLine.startsWith('+++ ')) {
+      currentFile.newPath = stripDiffPath(rawLine.slice(4));
+      continue;
+    }
+
+    const hunkMatch = rawLine.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*$/);
+    if (hunkMatch) {
+      oldLine = Number(hunkMatch[1]);
+      newLine = Number(hunkMatch[3]);
+      currentFile.hunks.push({
+        id: `${currentFile.id}:hunk:${currentFile.hunks.length}`,
+        header: rawLine,
+        oldStart: oldLine,
+        oldLines: Number(hunkMatch[2] ?? 1),
+        newStart: newLine,
+        newLines: Number(hunkMatch[4] ?? 1),
+        lines: []
+      });
+      continue;
+    }
+
+    const currentHunk = currentFile.hunks[currentFile.hunks.length - 1];
+    if (!currentHunk) {
+      continue;
+    }
+
+    const lineId = `${currentHunk.id}:line:${currentHunk.lines.length}`;
+    const parsedLine = parseDiffLine(rawLine, lineId, oldLine, newLine);
+    currentHunk.lines.push(parsedLine.line);
+    oldLine = parsedLine.nextOldLine;
+    newLine = parsedLine.nextNewLine;
+  }
+
+  return files.filter((file) => file.hunks.length > 0);
+}
+
+export async function getUntrackedDiffFiles(repoRoot: string): Promise<DiffFile[]> {
+  const { stdout } = await execFileAsync(
+    'git',
+    ['ls-files', '--others', '--exclude-standard', '-z'],
+    {
+      cwd: repoRoot,
+      maxBuffer: 20 * 1024 * 1024
+    }
+  );
+  const filePaths = stdout.split('\0').filter(Boolean);
+  const files = await Promise.all(
+    filePaths.map((filePath, index) => createUntrackedDiffFile(repoRoot, filePath, index))
+  );
+  return files;
+}
+
+async function createUntrackedDiffFile(
+  repoRoot: string,
+  filePath: string,
+  index: number
+): Promise<DiffFile> {
+  const id = `untracked:${index}:/dev/null:${filePath}`;
+  const absolutePath = path.join(repoRoot, filePath);
+  const fileStat = await stat(absolutePath);
+
+  if (fileStat.size > maxUntrackedTextBytes) {
+    return createMetaOnlyDiffFile(id, filePath, `File is ${formatBytes(fileStat.size)}; preview skipped.`);
+  }
+
+  const buffer = await readFile(absolutePath);
+  if (!isLikelyText(buffer)) {
+    return createMetaOnlyDiffFile(id, filePath, 'Binary file not shown.');
+  }
+
+  const normalized = buffer.toString('utf8').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const content = normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized;
+  const lines = content ? content.split('\n') : [];
+  const hunkId = `${id}:hunk:0`;
+
+  return {
+    id,
+    source: 'untracked',
+    oldPath: '/dev/null',
+    newPath: filePath,
+    hunks: [
+      {
+        id: hunkId,
+        header: `@@ -0,0 +1,${lines.length} @@`,
+        oldStart: 0,
+        oldLines: 0,
+        newStart: 1,
+        newLines: lines.length,
+        lines: lines.map<DiffLine>((line, lineIndex) => ({
+          id: `${hunkId}:line:${lineIndex}`,
+          type: 'add',
+          raw: `+${line}`,
+          content: line,
+          newLine: lineIndex + 1
+        }))
+      }
+    ]
+  };
+}
+
+function createMetaOnlyDiffFile(id: string, filePath: string, message: string): DiffFile {
+  const hunkId = `${id}:hunk:0`;
+  return {
+    id,
+    source: 'untracked',
+    oldPath: '/dev/null',
+    newPath: filePath,
+    hunks: [
+      {
+        id: hunkId,
+        header: '@@ -0,0 +0,0 @@',
+        oldStart: 0,
+        oldLines: 0,
+        newStart: 0,
+        newLines: 0,
+        lines: [
+          {
+            id: `${hunkId}:line:0`,
+            type: 'meta',
+            raw: message,
+            content: message
+          }
+        ]
+      }
+    ]
+  };
+}
+
+async function getLatestChangedFileTime(
+  repoRoot: string,
+  files: DiffFile[]
+): Promise<string | undefined> {
+  const filePaths = new Set<string>();
+  for (const file of files) {
+    if (file.oldPath !== '/dev/null') {
+      filePaths.add(file.oldPath);
+    }
+    if (file.newPath !== '/dev/null') {
+      filePaths.add(file.newPath);
+    }
+  }
+
+  const mtimes = await Promise.all(
+    [...filePaths].map(async (filePath) => {
+      try {
+        return (await stat(path.join(repoRoot, filePath))).mtimeMs;
+      } catch {
+        return 0;
+      }
+    })
+  );
+  const latest = Math.max(0, ...mtimes);
+  return latest > 0 ? new Date(latest).toISOString() : undefined;
+}
+
+function isLikelyText(buffer: Buffer): boolean {
+  return !buffer.includes(0);
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function parseDiffLine(
+  rawLine: string,
+  id: string,
+  currentOldLine: number,
+  currentNewLine: number
+): { line: DiffLine; nextOldLine: number; nextNewLine: number } {
+  if (rawLine.startsWith('+')) {
+    return {
+      line: {
+        id,
+        type: 'add',
+        raw: rawLine,
+        content: rawLine.slice(1),
+        newLine: currentNewLine
+      },
+      nextOldLine: currentOldLine,
+      nextNewLine: currentNewLine + 1
+    };
+  }
+
+  if (rawLine.startsWith('-')) {
+    return {
+      line: {
+        id,
+        type: 'remove',
+        raw: rawLine,
+        content: rawLine.slice(1),
+        oldLine: currentOldLine
+      },
+      nextOldLine: currentOldLine + 1,
+      nextNewLine: currentNewLine
+    };
+  }
+
+  if (rawLine.startsWith(' ')) {
+    return {
+      line: {
+        id,
+        type: 'context',
+        raw: rawLine,
+        content: rawLine.slice(1),
+        oldLine: currentOldLine,
+        newLine: currentNewLine
+      },
+      nextOldLine: currentOldLine + 1,
+      nextNewLine: currentNewLine + 1
+    };
+  }
+
+  return {
+    line: {
+      id,
+      type: 'meta',
+      raw: rawLine,
+      content: rawLine
+    },
+    nextOldLine: currentOldLine,
+    nextNewLine: currentNewLine
+  };
+}
+
+export async function listBranches(
+  repoRoot: string
+): Promise<{ current: string; branches: string[] }> {
+  const [branchesResult, currentResult] = await Promise.all([
+    execFileAsync('git', ['branch', '--format=%(refname:short)'], { cwd: repoRoot }),
+    execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoRoot })
+  ]);
+  const branches = branchesResult.stdout
+    .trim()
+    .split('\n')
+    .map((b) => b.trim())
+    .filter(Boolean);
+  const current = currentResult.stdout.trim() || 'unknown';
+  return { current, branches };
+}
+
+export async function checkoutBranch(repoRoot: string, branch: string): Promise<void> {
+  await execFileAsync('git', ['checkout', branch], { cwd: repoRoot });
+}
+
+export async function createBranch(repoRoot: string, name: string): Promise<void> {
+  await execFileAsync('git', ['checkout', '-b', name], { cwd: repoRoot });
+}
+
+export async function deleteBranch(repoRoot: string, name: string): Promise<void> {
+  await execFileAsync('git', ['branch', '-D', name], { cwd: repoRoot });
+}
+
+export async function stageFiles(repoRoot: string, files: string[]): Promise<void> {
+  const args = files.length > 0 ? ['add', '--', ...files] : ['add', '-A'];
+  await execFileAsync('git', args, { cwd: repoRoot });
+}
+
+export async function unstageFiles(repoRoot: string, files: string[]): Promise<void> {
+  const args =
+    files.length > 0 ? ['restore', '--staged', '--', ...files] : ['restore', '--staged', '.'];
+  await execFileAsync('git', args, { cwd: repoRoot });
+}
+
+export async function commitChanges(
+  repoRoot: string,
+  message: string
+): Promise<{ hash: string }> {
+  await execFileAsync('git', ['commit', '-m', message], { cwd: repoRoot });
+  const { stdout } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], {
+    cwd: repoRoot
+  });
+  return { hash: stdout.trim() };
+}
+
+function stripDiffPath(rawPath: string): string {
+  if (rawPath === '/dev/null') {
+    return rawPath;
+  }
+  if (rawPath.startsWith('a/') || rawPath.startsWith('b/')) {
+    return rawPath.slice(2);
+  }
+  return rawPath;
+}

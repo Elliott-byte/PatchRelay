@@ -1,0 +1,22 @@
+{
+  "name": "patchrelay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/core",
+    "packages/server",
+    "packages/web",
+    "packages/cli"
+  ],
+  "scripts": {
+    "build": "npm run build -w @patchrelay/core && npm run build -w @patchrelay/server && npm run build -w @patchrelay/web && npm run build -w @patchrelay/cli",
+    "typecheck": "npm run build -w @patchrelay/core && npm run build -w @patchrelay/server && npm run typecheck -w @patchrelay/web && npm run typecheck -w @patchrelay/cli",
+    "patchrelay": "npm run start -w @patchrelay/cli --",
+    "dev:web": "npm run dev -w @patchrelay/web"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.3"
+  }
+}
