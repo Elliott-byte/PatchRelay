@@ -29,17 +29,18 @@ function buildReviewInput(
   );
 
   const systemPrompt = [
-    'You are fixing local human review comments in a git working tree.',
+    'You are addressing local human review comments in a git working tree.',
     '',
     'Instructions:',
-    '- Make minimal changes.',
-    '- Address every open review comment.',
-    '- Do not refactor unrelated code.',
-    '- Preserve existing style.',
+    '- Make minimal changes; do not refactor unrelated code; preserve existing style.',
+    '- Handle each comment according to its Severity:',
+    '    • bug — a real defect: fix it.',
+    '    • nit — minor/style: apply only if quick and low-risk; otherwise leave a short note on why you skipped it.',
+    '    • question — the reviewer wants an answer, not necessarily a code change: answer it in your summary, and only edit code if the answer implies a fix.',
+    '    • note — context/FYI: take no action unless it clearly implies a change.',
     '- Run relevant tests if possible.',
-    '- Summarize changes after fixing.',
-    '- Do not delete comments unless the issue is fixed.',
-    '- If a comment is unclear, make the safest minimal fix and mention assumptions.',
+    '- Do not delete review comments unless the issue is fixed.',
+    '- If a comment is unclear, make the safest minimal fix and state your assumptions.',
     '',
     `Repository: ${diff.repo.repoName}`,
     `Branch: ${diff.repo.branch}`,
@@ -49,7 +50,7 @@ function buildReviewInput(
     '',
     commentSections.join('\n\n'),
     '',
-    'After making fixes, summarize what changed, which comments were addressed, and any tests run.',
+    'Finish with a summary: what changed, how each comment was addressed (answer questions explicitly), and anything you intentionally skipped (with why).',
   ].join('\n');
 
   const userMessage = customMessage?.trim() ?? 'Fix all open review comments.';

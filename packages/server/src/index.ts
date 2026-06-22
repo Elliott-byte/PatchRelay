@@ -18,6 +18,7 @@ import {
   createComment,
   deleteComment,
   fetchRemote,
+  getBranchComparison,
   getCodexSession,
   getCommitDiff,
   getCommitLog,
@@ -266,6 +267,15 @@ async function handleApiRequest(
     return;
   }
 
+  // Compare the current branch against a base ref (PR-style diff).
+  if (method === 'GET' && pathName === '/api/git/compare') {
+    const base = (url.searchParams.get('base') ?? '').trim();
+    // Allow branch/ref name chars only; reject leading '-' so it can't be a git flag.
+    if (!base || base.startsWith('-') || !/^[\w./@-]+$/.test(base)) { sendJson(res, 400, { error: 'Invalid base ref' }); return; }
+    sendJson(res, 200, await getBranchComparison(repoRoot, base));
+    return;
+  }
+
   if (method === 'POST' && (pathName === '/api/git/push' || pathName === '/api/git/pull' || pathName === '/api/git/fetch')) {
     try {
       const op = pathName === '/api/git/push' ? pushChanges : pathName === '/api/git/pull' ? pullChanges : fetchRemote;
@@ -508,26 +518,33 @@ async function loadCodexModels(): Promise<{ id: string; label: string }[]> {
 
 /** Ask the configured agent for a one-line commit message describing the staged diff. */
 async function generateCommitMessage(repoRoot: string): Promise<string> {
-  const { stdout: staged } = await execFileAsync('git', ['diff', '--cached'], {
-    cwd: repoRoot,
-    maxBuffer: 16 * 1024 * 1024,
-  });
+  // Keep input tokens low: a compact --stat summary (all files) plus a short slice
+  // of the actual diff is enough to write a subject, without sending the whole diff.
+  const [statRes, stagedRes] = await Promise.all([
+    execFileAsync('git', ['diff', '--cached', '--stat'], { cwd: repoRoot, maxBuffer: 1024 * 1024 }).catch(() => ({ stdout: '' })),
+    execFileAsync('git', ['diff', '--cached'], { cwd: repoRoot, maxBuffer: 16 * 1024 * 1024 }),
+  ]);
+  const stat = statRes.stdout.trim();
+  const staged = stagedRes.stdout;
   if (!staged.trim()) throw new Error('No staged changes to summarize. Stage files first.');
 
   const config = await loadConfig(repoRoot);
-  // Use plain (non-streaming) output for a quick one-shot answer.
+  // Plain (non-streaming) output for a quick one-shot answer, on the default model.
   const command = config.claudeCommand
     .replace(/--output-format\s+stream-json/, '')
     .replace(/--verbose/, '')
     .replace(/\s+/g, ' ')
     .trim();
   const prompt = [
-    'Write a single Conventional Commits message for the following staged git diff.',
-    'Rules: one line, lowercase type prefix (feat/fix/refactor/docs/chore/etc.),',
-    'subject under 72 characters, imperative mood. Output ONLY the message — no quotes,',
-    'no code fences, no explanation.',
+    'Write a single Conventional Commits message for these staged changes.',
+    'Rules: one line, lowercase type prefix (feat/fix/refactor/docs/chore), subject',
+    'under 72 chars, imperative mood. Output ONLY the message — no quotes/fences/explanation.',
     '',
-    staged.slice(0, 12000),
+    'Files changed:',
+    stat,
+    '',
+    'Diff excerpt:',
+    staged.slice(0, 4000),
   ].join('\n');
 
   const result = await runAgentCommand(command, prompt, repoRoot);

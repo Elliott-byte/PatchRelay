@@ -299,6 +299,27 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 .branch-item:hover .branch-delete-btn { opacity: 1; }
 .branch-delete-btn:hover { background: var(--red-dim); color: var(--red); }
 
+.branch-compare-btn {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-xs);
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  flex-shrink: 0;
+  font-size: 13px;
+  height: 26px;
+  justify-content: center;
+  line-height: 1;
+  opacity: 0;
+  padding: 0;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+  width: 26px;
+}
+.branch-item:hover .branch-compare-btn { opacity: 1; }
+.branch-compare-btn:hover { background: var(--accent-dim); color: var(--accent); }
+
 .branch-new {
   border-top: 1px solid var(--glass-border);
   padding: 6px;
@@ -1069,12 +1090,43 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 }
 .diff-line:hover .comment-btn, .comment-btn:focus { opacity: 1; }
 
-.diff-line pre {
+.diff-line pre,
+.split-cell pre {
   color: var(--text);
   font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px; line-height: 18px; margin: 0; overflow-x: auto; padding: 3px 8px; white-space: pre;
 }
 .diff-pfx { display: inline-block; width: 14px; }
+
+/* ── Split (side-by-side) view ─────────────────────── */
+.diff-view-toggle {
+  border: 1px solid var(--glass-border); border-radius: var(--radius-xs);
+  display: inline-flex; flex: 0 0 auto; margin-left: auto; overflow: hidden;
+}
+.diff-view-toggle button {
+  background: transparent; border: 0; color: var(--text-2); cursor: pointer;
+  font-size: 11px; font-weight: 500; padding: 3px 10px; transition: background 0.12s, color 0.12s;
+}
+.diff-view-toggle button.active { background: var(--accent-dim); color: var(--accent); }
+.diff-view-toggle button:not(.active):hover { background: var(--glass-hover); color: var(--text); }
+
+.commit-view-title { align-items: center; display: flex; gap: 10px; }
+
+.split-row { display: grid; grid-template-columns: 1fr 1fr; }
+.split-cell {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  min-width: 0;
+  position: relative;
+}
+.split-row > .split-cell:first-child { border-right: 1px solid var(--glass-border); }
+.split-cell .ln { align-self: stretch; }
+.split-cell.split-empty { background: repeating-linear-gradient(45deg, transparent, transparent 6px, rgba(128,128,128,0.05) 6px, rgba(128,128,128,0.05) 12px); }
+.split-cell .comment-btn {
+  left: 48px; position: absolute; top: 1px; z-index: 2;
+  height: 18px; width: 18px; font-size: 13px;
+}
+.split-cell:hover .comment-btn { opacity: 1; }
 
 /* ── Review comment ───────────────────────────────── */
 .review-comment, .comment-editor {
@@ -1120,19 +1172,41 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 .text-btn:hover:not(:disabled) { text-decoration: underline; }
 .text-btn.danger { color: var(--red); }
 
-.comment-editor { display: grid; gap: 8px; padding: 10px; }
-.comment-editor-toolbar { display: flex; gap: 8px; }
+.comment-editor { display: grid; gap: 10px; padding: 12px; }
+.comment-editor-toolbar { align-items: center; display: flex; gap: 8px; }
+
+.sev-dot { border-radius: 50%; flex: 0 0 auto; height: 8px; width: 8px; }
+.sev-dot.sev-bug { background: var(--red); }
+.sev-dot.sev-question { background: var(--accent); }
+.sev-dot.sev-nit { background: var(--yellow); }
+.sev-dot.sev-note { background: var(--text-muted); }
+
+/* Severity picker reuses the shared DropdownSelect; just size it for the toolbar. */
+.comment-editor-toolbar .dd-root { width: 150px; }
+
 .comment-editor textarea {
   background: var(--bg-3); border: 1px solid var(--glass-border); border-radius: var(--radius-xs);
-  color: var(--text); min-height: 80px; padding: 8px; resize: vertical; width: 100%;
+  color: var(--text); font: inherit; line-height: 1.55; min-height: 76px; padding: 9px 11px;
+  resize: vertical; width: 100%;
 }
 .comment-editor textarea::placeholder { color: var(--text-muted); }
 .comment-editor textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); outline: none; }
-.comment-editor select {
-  background: var(--bg-3); border: 1px solid var(--glass-border); border-radius: var(--radius-xs);
-  color: var(--text); padding: 4px 8px;
+
+.comment-editor-actions { align-items: center; display: flex; gap: 8px; }
+.comment-submit {
+  background: var(--accent-dim); border: 1px solid rgba(10,132,255,0.3); border-radius: var(--radius-xs);
+  color: var(--accent); cursor: pointer; font-size: 12px; font-weight: 600; padding: 6px 16px;
+  transition: background 0.12s;
 }
-.comment-editor-actions { display: flex; gap: 8px; }
+.comment-submit:hover:not(:disabled) { background: var(--accent-glow); }
+.comment-submit:disabled { cursor: not-allowed; opacity: 0.4; }
+.comment-cancel {
+  background: transparent; border: 1px solid var(--glass-border); border-radius: var(--radius-xs);
+  color: var(--text-2); cursor: pointer; font-size: 12px; font-weight: 500; padding: 6px 14px;
+  transition: background 0.12s, color 0.12s;
+}
+.comment-cancel:hover { background: var(--glass-hover); color: var(--text); }
+.comment-hint { color: var(--text-muted); font-size: 10px; margin-left: auto; white-space: nowrap; }
 
 /* ── Floating chat ────────────────────────────────── */
 .chat-float {

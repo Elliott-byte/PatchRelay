@@ -521,6 +521,32 @@ export async function getCommitDiff(repoRoot: string, hash: string): Promise<Com
   };
 }
 
+export interface BranchComparison {
+  base: string;
+  head: string;
+  ahead: number;   // commits on head not in base
+  behind: number;  // commits on base not in head
+  files: DiffFile[];
+}
+
+/**
+ * Compare the current branch against `base` (PR-style): `git diff base...HEAD`
+ * shows what HEAD introduced since it diverged from base.
+ */
+export async function getBranchComparison(repoRoot: string, base: string): Promise<BranchComparison> {
+  const head = (await gitTry(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD'])) || 'HEAD';
+  const diff = await gitTry(repoRoot, ['diff', `${base}...HEAD`, '--no-color', '--no-ext-diff']);
+  const counts = await gitTry(repoRoot, ['rev-list', '--count', '--left-right', `${base}...HEAD`]);
+  const m = counts.match(/(\d+)\s+(\d+)/);
+  return {
+    base,
+    head,
+    behind: m ? Number(m[1]) : 0,
+    ahead: m ? Number(m[2]) : 0,
+    files: parseUnifiedDiff(diff, 'committed'),
+  };
+}
+
 function stripDiffPath(rawPath: string): string {
   if (rawPath === '/dev/null') {
     return rawPath;
