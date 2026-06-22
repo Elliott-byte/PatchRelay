@@ -1,4 +1,4 @@
-export type DiffSource = 'staged' | 'unstaged' | 'untracked';
+export type DiffSource = 'staged' | 'unstaged' | 'untracked' | 'committed';
 export type DiffLineType = 'context' | 'add' | 'remove' | 'meta';
 export type CommentSide = 'old' | 'new';
 export type CommentSeverity = 'note' | 'bug' | 'question' | 'nit';

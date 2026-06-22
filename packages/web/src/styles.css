@@ -774,10 +774,57 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 .src-staged    { background: var(--green-dim);  color: var(--green); }
 .src-unstaged  { background: var(--yellow-dim); color: var(--yellow); }
 .src-untracked { background: var(--accent-dim); color: var(--accent); }
+.src-committed { background: var(--glass-border); color: var(--text-2); }
+
+/* ── Commit history (left panel) ───────────────────── */
+.commit-log { flex: 1 1 0; min-height: 0; overflow: auto; padding: 6px; }
+.commit-row {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 1px;
+  padding: 7px 8px;
+  text-align: left;
+  transition: background 0.12s;
+  width: 100%;
+}
+.commit-row:hover { background: var(--glass-hover); }
+.commit-row.active { background: var(--accent-dim); border-color: rgba(10,132,255,0.2); }
+.commit-subject {
+  color: var(--text); font-size: 12px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%;
+}
+.commit-meta { align-items: center; color: var(--text-muted); display: flex; font-size: 10px; gap: 6px; min-width: 0; }
+.commit-hash {
+  background: var(--bg-3); border-radius: 4px; color: var(--text-2);
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px; padding: 0 4px;
+}
+.commit-author { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.commit-date { flex: 0 0 auto; margin-left: auto; }
+
+/* ── Commit detail view (center) ───────────────────── */
+.commit-view-header {
+  backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
+  background: var(--glass); border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow-sm), var(--hairline);
+  margin-bottom: 12px; padding: 12px 14px;
+}
+.commit-view-title { color: var(--text); font-size: 14px; font-weight: 600; margin-bottom: 6px; }
+.commit-view-meta { align-items: center; color: var(--text-2); display: flex; flex-wrap: wrap; font-size: 12px; gap: 10px; }
+.commit-view-body {
+  border-top: 1px solid var(--glass-border); color: var(--text-2);
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; margin: 10px 0 0; padding-top: 10px; white-space: pre-wrap; word-break: break-word;
+}
 
 .empty-hint { color: var(--text-2); font-size: 12px; padding: 12px; }
 
-.commit-panel { border-top: 1px solid var(--glass-border); box-shadow: var(--hairline); display: grid; flex: 0 0 auto; gap: 8px; padding: 12px; }
+.commit-panel { border-top: 1px solid var(--glass-border); box-shadow: var(--hairline); display: grid; flex: 0 0 auto; gap: 8px; grid-template-columns: minmax(0, 1fr); padding: 12px; }
 
 .commit-input {
   background: var(--bg-3);
@@ -793,14 +840,15 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 .commit-gen-btn {
   background: var(--accent-dim); border: 1px solid rgba(10,132,255,0.3);
   border-radius: var(--radius-xs); color: var(--accent);
-  flex: 1 1 0; font-weight: 600; padding: 7px 12px; transition: background 0.15s; white-space: nowrap;
+  flex: 1 1 0; font-weight: 600; min-width: 0; overflow: hidden; padding: 7px 10px;
+  text-overflow: ellipsis; transition: background 0.15s; white-space: nowrap;
 }
 .commit-gen-btn:hover:not(:disabled) { background: var(--accent-glow); }
 
 .commit-btn {
   background: var(--green-dim); border: 1px solid rgba(48,209,88,0.3);
   border-radius: var(--radius-xs); color: var(--green);
-  flex: 1 1 0; font-weight: 600; padding: 7px 12px; transition: background 0.15s;
+  flex: 1 1 0; font-weight: 600; min-width: 0; padding: 7px 10px; transition: background 0.15s;
 }
 .commit-btn:hover:not(:disabled) { background: rgba(48,209,88,0.22); }
 .commit-hint { color: var(--text-muted); font-size: 11px; margin: 0; text-align: center; }
@@ -815,7 +863,7 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
   margin-top: 2px;
   padding-top: 10px;
 }
-.sync-status { font-size: 11px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sync-status { flex: 1 1 0; font-size: 11px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sync-clean { color: var(--text-2); }
 .sync-counts { align-items: center; display: inline-flex; gap: 6px; }
 .sync-behind { color: var(--yellow); font-weight: 600; }
@@ -853,7 +901,7 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
   flex: 1 1 0;
   min-height: 0;
   overflow: auto;
-  padding: 12px 12px 20px;
+  padding: 12px 12px 92px;  /* room to scroll content clear of the floating chat */
 }
 
 /* ── Files toolbar ────────────────────────────────── */
@@ -1033,9 +1081,10 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 
 /* ── Floating chat ────────────────────────────────── */
 .chat-float {
-  align-self: center;
-  flex: 0 0 auto;
-  margin: 10px auto 14px;
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
   width: min(600px, calc(100% - 40px));
   z-index: 20;
 
@@ -1317,6 +1366,29 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
   font-size: 11px;
 }
 
+/* Live reasoning timer (streaming bubble) */
+.msg-timer {
+  align-items: center;
+  color: var(--text-2);
+  display: inline-flex;
+  font-feature-settings: "tnum";
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  gap: 5px;
+}
+.msg-timer-dot {
+  background: var(--green);
+  border-radius: 50%;
+  box-shadow: 0 0 0 0 var(--green);
+  height: 6px;
+  width: 6px;
+  animation: timer-pulse 1.4s ease-in-out infinite;
+}
+@keyframes timer-pulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(48,209,88,0.5); }
+  50% { opacity: 0.5; box-shadow: 0 0 0 4px rgba(48,209,88,0); }
+}
+
 .msg-body {
   color: var(--text);
   display: block;
@@ -1397,6 +1469,41 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
   font-size: 11px;
   padding: 0;
 }
+
+/* Inline `code` inside chat messages */
+.msg-body code.md-inline {
+  background: var(--bg-3);
+  border: 1px solid var(--glass-border);
+  border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  padding: 1px 5px;
+}
+
+/* Syntax-highlighted fenced code blocks in chat messages */
+.md-code {
+  background: var(--bg-2);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-xs);
+  margin: 8px 0;
+  overflow: hidden;
+  position: relative;
+}
+.md-code-lang {
+  color: var(--text-muted);
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  padding: 5px 12px 0;
+  text-transform: uppercase;
+}
+.md-code pre, .md-code code {
+  background: transparent !important;
+  border: 0 !important;
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+.md-code pre { margin: 0 !important; overflow-x: auto; }
 
 .msg-body blockquote {
   border-left: 3px solid var(--accent);
@@ -1497,8 +1604,33 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
   min-height: 0;
   overflow: hidden;
 }
+
+/* Image preview (checkerboard backdrop so transparency is visible) */
+.image-preview {
+  align-items: center;
+  display: flex;
+  height: 100%;
+  justify-content: center;
+  overflow: auto;
+  padding: 24px;
+  background-color: var(--bg-2);
+  background-image:
+    linear-gradient(45deg, var(--glass-border) 25%, transparent 25%),
+    linear-gradient(-45deg, var(--glass-border) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, var(--glass-border) 75%),
+    linear-gradient(-45deg, transparent 75%, var(--glass-border) 75%);
+  background-size: 20px 20px;
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+}
+.image-preview img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: var(--radius-xs);
+  box-shadow: var(--shadow);
+}
 .file-editor-content .cm-editor { height: 100%; background: transparent; }
-.file-editor-content .cm-scroller { overflow: auto; }
+.file-editor-content .cm-scroller { overflow: auto; padding-bottom: 72px; }
 .file-editor-content .cm-gutters { background: transparent; border-right: 1px solid var(--glass-border); }
 
 /* ── Empty states ─────────────────────────────────── */

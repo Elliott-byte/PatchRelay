@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -159,8 +160,35 @@ function cleanCodexUserMessage(text: string): string {
 
 // ── Claude Code ───────────────────────────────────────────────────────────────
 
+/** Candidate roots that hold Claude Code project dirs, in priority order. */
+export function claudeProjectsRoots(): string[] {
+  const roots = [path.join(os.homedir(), '.claude', 'projects')];
+  // The Windows desktop app may store under %APPDATA%\Claude\projects.
+  if (process.platform === 'win32' && process.env.APPDATA) {
+    roots.push(path.join(process.env.APPDATA, 'Claude', 'projects'));
+  }
+  return roots;
+}
+
+/**
+ * Resolve the Claude project dir for a repo. Claude encodes the cwd by replacing
+ * path separators (and the Windows drive colon) with '-'. We try a few encodings
+ * and roots and return whichever exists (so it works on macOS, Linux/WSL, Windows).
+ */
 function claudeProjectDir(repoRoot: string): string {
-  return path.join(os.homedir(), '.claude', 'projects', repoRoot.replace(/\//g, '-'));
+  const names = [
+    repoRoot.replace(/[\\/:]/g, '-'), // Windows: C:\x -> C--x ; Unix unchanged beyond '/'
+    repoRoot.replace(/[\\/]/g, '-'),
+    repoRoot.replace(/\//g, '-'),
+  ];
+  const roots = claudeProjectsRoots();
+  for (const root of roots) {
+    for (const name of names) {
+      const dir = path.join(root, name);
+      if (existsSync(dir)) return dir;
+    }
+  }
+  return path.join(roots[0], names[0]);
 }
 
 async function listClaudeSessions(repoRoot: string): Promise<SessionListItem[]> {

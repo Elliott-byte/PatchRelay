@@ -1,8 +1,26 @@
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { readdir, writeFile, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { AgentRunResult } from './types.js';
+
+/**
+ * Pick an available POSIX shell. zsh isn't guaranteed on Linux/WSL, so fall back
+ * to the user's $SHELL, then bash, then sh. Only bash/zsh get a login (`-l`) flag
+ * (dash/sh don't support it reliably).
+ */
+function pickUnixShell(shellCommand: string): [string, string[]] {
+  const candidates = [process.env.SHELL, '/bin/zsh', '/usr/bin/zsh', '/bin/bash', '/usr/bin/bash', '/bin/sh'];
+  for (const sh of candidates) {
+    if (sh && existsSync(sh)) {
+      const name = path.basename(sh);
+      const flags = name === 'zsh' || name === 'bash' ? ['-l', '-c'] : ['-c'];
+      return [sh, [...flags, shellCommand]];
+    }
+  }
+  return ['/bin/sh', ['-c', shellCommand]];
+}
 
 async function resolvedPath(): Promise<string> {
   const extra: string[] = [];
@@ -51,15 +69,18 @@ export async function runAgentCommand(
   const tmpPrompt = path.join(os.tmpdir(), `patchrelay-prompt-${Date.now()}.txt`);
   await writeFile(tmpPrompt, prompt, 'utf8');
 
-  // Redirect stdin from temp file — `< "path"` works on both Unix shell and Windows cmd.exe
-  const shellCommand = `${command} < ${JSON.stringify(tmpPrompt)}`;
+  // Redirect stdin from temp file — plain double-quotes work on both POSIX shells
+  // and cmd.exe. (JSON.stringify would double-escape backslashes and break on Windows.)
+  const shellCommand = `${command} < "${tmpPrompt}"`;
 
-  // On macOS/Linux: run via login shell so PATH is sourced from the user's profile.
   // On Windows: use cmd.exe (supports < redirection and finds claude/codex on PATH).
+  // On macOS/Linux/WSL: pick an available shell (zsh isn't guaranteed — bash/sh are
+  // common on Linux/WSL) and run a login shell when supported so the user's profile
+  // (nvm/volta/etc.) is sourced.
   const [shell, shellArgs]: [string, string[]] =
     process.platform === 'win32'
-      ? ['cmd.exe', ['/c', shellCommand]]
-      : ['/bin/zsh', ['-l', '-c', shellCommand]];
+      ? [process.env.ComSpec ?? 'cmd.exe', ['/c', shellCommand]]
+      : pickUnixShell(shellCommand);
 
   return new Promise((resolve) => {
     let stdout = '';

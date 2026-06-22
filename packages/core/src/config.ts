@@ -8,7 +8,7 @@ export const configFileName = 'config.json';
 
 export const defaultConfig: PatchRelayConfig = {
   codexCommand: 'codex exec --sandbox workspace-write -',
-  claudeCommand: 'claude -p --output-format stream-json',
+  claudeCommand: 'claude -p --verbose --output-format stream-json',
   includeStagedDiff: true,
   includeUnstagedDiff: true
 };

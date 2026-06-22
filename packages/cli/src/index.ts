@@ -1,9 +1,20 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findGitRoot, loadConfig } from '@patchrelay/core';
 import { startPatchRelayServer } from '@patchrelay/server';
+
+function isWSL(): boolean {
+  if (process.platform !== 'linux') return false;
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
+  try {
+    return readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft');
+  } catch {
+    return false;
+  }
+}
 
 interface CliOptions {
   open: boolean;
@@ -82,13 +93,22 @@ function resolveWebDist(): string {
 
 function openBrowser(url: string): void {
   const platform = process.platform;
-  const command =
-    platform === 'darwin' ? 'open' : platform === 'win32' ? 'cmd' : 'xdg-open';
-  const args = platform === 'win32' ? ['/c', 'start', '', url] : [url];
+  const wsl = isWSL();
+  let command: string;
+  let args: string[];
+  if (platform === 'darwin') { command = 'open'; args = [url]; }
+  else if (platform === 'win32') { command = 'cmd'; args = ['/c', 'start', '', url]; }
+  else if (wsl) { command = 'wslview'; args = [url]; }
+  else { command = 'xdg-open'; args = [url]; }
 
-  const child = spawn(command, args, {
-    detached: true,
-    stdio: 'ignore'
+  const child = spawn(command, args, { detached: true, stdio: 'ignore' });
+  child.on('error', () => {
+    // On WSL, wslview/xdg-open may be absent — open via the Windows host instead.
+    if (wsl) {
+      const fb = spawn('powershell.exe', ['-NoProfile', '-Command', `Start-Process '${url}'`], { detached: true, stdio: 'ignore' });
+      fb.on('error', () => { /* give up silently; the URL is printed to stdout */ });
+      fb.unref();
+    }
   });
   child.unref();
 }

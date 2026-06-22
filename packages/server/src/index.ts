@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { createReadStream } from 'node:fs';
+import { createReadStream, readFileSync } from 'node:fs';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import os from 'node:os';
 import http, { type IncomingMessage, type Server, type ServerResponse } from 'node:http';
@@ -14,10 +14,13 @@ import {
   createBranch,
   deleteBranch,
   commitChanges,
+  claudeProjectsRoots,
   createComment,
   deleteComment,
   fetchRemote,
   getCodexSession,
+  getCommitDiff,
+  getCommitLog,
   getDiffResponse,
   getSessionById,
   getSyncStatus,
@@ -250,6 +253,19 @@ async function handleApiRequest(
     return;
   }
 
+  if (method === 'GET' && pathName === '/api/git/log') {
+    const limit = Number(url.searchParams.get('limit') ?? '60');
+    sendJson(res, 200, { commits: await getCommitLog(repoRoot, limit) });
+    return;
+  }
+
+  if (method === 'GET' && pathName === '/api/git/commit') {
+    const hash = (url.searchParams.get('hash') ?? '').trim();
+    if (!/^[0-9a-fA-F]{4,40}$/.test(hash)) { sendJson(res, 400, { error: 'Invalid commit hash' }); return; }
+    sendJson(res, 200, await getCommitDiff(repoRoot, hash));
+    return;
+  }
+
   if (method === 'POST' && (pathName === '/api/git/push' || pathName === '/api/git/pull' || pathName === '/api/git/fetch')) {
     try {
       const op = pathName === '/api/git/push' ? pushChanges : pathName === '/api/git/pull' ? pullChanges : fetchRemote;
@@ -306,32 +322,11 @@ async function handleApiRequest(
   }
 
   if (method === 'POST' && pathName === '/api/repo/pick') {
-    let stdout = '';
-    try {
-      if (process.platform === 'win32') {
-        // PowerShell folder picker
-        const psScript = [
-          'Add-Type -AssemblyName System.Windows.Forms',
-          '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
-          '$d.Description = "Select a git repository folder"',
-          'if ($d.ShowDialog() -eq "OK") { $d.SelectedPath } else { exit 1 }',
-        ].join('; ');
-        ({ stdout } = await execFileAsync('powershell', ['-NoProfile', '-Command', psScript]));
-      } else {
-        const script = 'POSIX path of (choose folder with prompt "Select a git repository folder:")';
-        ({ stdout } = await execFileAsync('osascript', ['-e', script]));
-      }
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      // osascript: user cancel = exit code -128; PowerShell: exit 1 when cancelled
-      if (msg.includes('-128') || /cancel/i.test(msg) || /exit code 1/i.test(msg)) {
-        sendJson(res, 200, { cancelled: true });
-      } else {
-        sendJson(res, 500, { error: msg });
-      }
-      return;
-    }
-    const chosen = stdout.trim().replace(/[\\/]$/, '');
+    const picked = await openFolderDialog();
+    if (picked.cancelled) { sendJson(res, 200, { cancelled: true }); return; }
+    if (picked.unsupported) { sendJson(res, 400, { error: picked.error ?? 'No folder picker available. Paste the repo path in the switcher instead.' }); return; }
+    if (picked.error) { sendJson(res, 500, { error: picked.error }); return; }
+    const chosen = (picked.path ?? '').trim().replace(/[\\/]$/, '');
     try {
       const gitRoot = await findGitRoot(chosen);
       state.repoRoot = gitRoot;
@@ -375,10 +370,25 @@ async function handleApiRequest(
   if (method === 'GET' && pathName === '/api/repo/file') {
     const rel = url.searchParams.get('path') ?? '';
     const abs = path.resolve(repoRoot, rel);
-    if (!abs.startsWith(repoRoot)) { sendJson(res, 403, { error: 'Forbidden' }); return; }
+    if (!isInsideRepo(repoRoot, abs)) { sendJson(res, 403, { error: 'Forbidden' }); return; }
     try {
       const content = await readFile(abs, 'utf8');
       sendJson(res, 200, { content, path: rel });
+    } catch {
+      sendJson(res, 404, { error: 'Not found' });
+    }
+    return;
+  }
+
+  // Raw file bytes (images, binaries) with correct content-type — for previewing.
+  if (method === 'GET' && pathName === '/api/repo/raw') {
+    const rel = url.searchParams.get('path') ?? '';
+    const abs = path.resolve(repoRoot, rel);
+    if (!isInsideRepo(repoRoot, abs)) { sendJson(res, 403, { error: 'Forbidden' }); return; }
+    try {
+      const fileStat = await stat(abs);
+      if (!fileStat.isFile()) { sendJson(res, 404, { error: 'Not found' }); return; }
+      streamFile(res, abs);
     } catch {
       sendJson(res, 404, { error: 'Not found' });
     }
@@ -444,22 +454,21 @@ async function listKnownRepos(currentRoot: string): Promise<{ path: string; name
   // Always include current repo
   addRepo(currentRoot);
 
-  // Discover from ~/.claude/projects/ (or %APPDATA%\Claude\projects on Windows)
-  // Dirs are encoded repo paths: leading / removed, remaining / replaced with -
-  const claudeBase = process.platform === 'win32'
-    ? path.join(process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming'), 'Claude')
-    : path.join(os.homedir(), '.claude');
-  const claudeProjects = path.join(claudeBase, 'projects');
-  try {
-    const entries = await readdir(claudeProjects);
-    for (const entry of entries) {
-      const repoPath = '/' + entry.replace(/^-/, '').replace(/-/g, '/');
-      try {
-        await stat(repoPath);
-        addRepo(repoPath);
-      } catch { /* path doesn't exist */ }
-    }
-  } catch { /* no claude projects dir */ }
+  // Discover from Claude project dirs (encoded repo paths: separators -> '-').
+  // Decoding is lossy/Unix-oriented; we stat each candidate and keep what exists,
+  // so Windows-encoded names that don't resolve are simply skipped.
+  for (const claudeProjects of claudeProjectsRoots()) {
+    try {
+      const entries = await readdir(claudeProjects);
+      for (const entry of entries) {
+        const repoPath = '/' + entry.replace(/^-/, '').replace(/-/g, '/');
+        try {
+          await stat(repoPath);
+          addRepo(repoPath);
+        } catch { /* path doesn't exist on this platform */ }
+      }
+    } catch { /* no claude projects dir here */ }
+  }
 
   // Discover from ~/.codex/sessions/ — subdirs named after repo paths
   const codexSessions = path.join(os.homedir(), '.codex', 'sessions');
@@ -507,7 +516,11 @@ async function generateCommitMessage(repoRoot: string): Promise<string> {
 
   const config = await loadConfig(repoRoot);
   // Use plain (non-streaming) output for a quick one-shot answer.
-  const command = config.claudeCommand.replace(/--output-format\s+stream-json/, '').trim();
+  const command = config.claudeCommand
+    .replace(/--output-format\s+stream-json/, '')
+    .replace(/--verbose/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
   const prompt = [
     'Write a single Conventional Commits message for the following staged git diff.',
     'Rules: one line, lowercase type prefix (feat/fix/refactor/docs/chore/etc.),',
@@ -656,6 +669,88 @@ function safeJoin(root: string, relativePath: string): string | undefined {
     return undefined;
   }
   return resolvedPath;
+}
+
+/**
+ * Whether `abs` is the repo root or contained within it. Uses path.relative so it
+ * is correct across separators (and case-insensitive drives on Windows), unlike a
+ * raw startsWith which mishandles `\` and `/repo` vs `/repo-evil`.
+ */
+function isInsideRepo(repoRoot: string, abs: string): boolean {
+  const rel = path.relative(path.resolve(repoRoot), abs);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function isWSL(): boolean {
+  if (process.platform !== 'linux') return false;
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
+  try {
+    return readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft');
+  } catch {
+    return false;
+  }
+}
+
+interface FolderPickResult { path?: string; cancelled?: boolean; unsupported?: boolean; error?: string }
+
+const WIN_FOLDER_PS = [
+  'Add-Type -AssemblyName System.Windows.Forms',
+  '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
+  '$d.Description = "Select a git repository folder"',
+  'if ($d.ShowDialog() -eq "OK") { $d.SelectedPath } else { exit 1 }',
+].join('; ');
+
+/** Native folder picker per platform: macOS (osascript), Windows (PowerShell),
+ *  Linux (zenity), WSL (Windows PowerShell via interop, path mapped with wslpath). */
+async function openFolderDialog(): Promise<FolderPickResult> {
+  const isCancel = (e: unknown) => {
+    const code = (e as { code?: unknown }).code;
+    const msg = e instanceof Error ? e.message : String(e);
+    return msg.includes('-128') || /\bcancel/i.test(msg) || code === 1 || code === '1' || /exit code 1\b/.test(msg);
+  };
+  const isMissing = (e: unknown) => (e as { code?: unknown }).code === 'ENOENT';
+
+  try {
+    if (process.platform === 'darwin') {
+      const { stdout } = await execFileAsync('osascript', ['-e', 'POSIX path of (choose folder with prompt "Select a git repository folder:")']);
+      return { path: stdout };
+    }
+    if (process.platform === 'win32') {
+      const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-Command', WIN_FOLDER_PS]);
+      return { path: stdout };
+    }
+  } catch (e) {
+    if (isCancel(e)) return { cancelled: true };
+    if (isMissing(e)) return { unsupported: true, error: 'Folder picker not available; paste the repo path instead.' };
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+
+  // Linux / WSL — try zenity first.
+  try {
+    const { stdout } = await execFileAsync('zenity', ['--file-selection', '--directory', '--title=Select a git repository folder']);
+    return { path: stdout };
+  } catch (e) {
+    if (isCancel(e)) return { cancelled: true };
+    if (!isMissing(e)) return { error: e instanceof Error ? e.message : String(e) };
+    // zenity missing — on WSL, fall back to the Windows picker via interop.
+    if (isWSL()) {
+      try {
+        const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-Command', WIN_FOLDER_PS]);
+        const winPath = stdout.trim();
+        if (!winPath) return { cancelled: true };
+        try {
+          const { stdout: unixPath } = await execFileAsync('wslpath', ['-u', winPath]);
+          return { path: unixPath };
+        } catch {
+          return { path: winPath };
+        }
+      } catch (e2) {
+        if (isCancel(e2)) return { cancelled: true };
+        /* fall through to unsupported */
+      }
+    }
+    return { unsupported: true, error: 'No folder picker found. Install zenity, or paste the repo path in the switcher.' };
+  }
 }
 
 function contentType(filePath: string): string {

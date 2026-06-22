@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
+import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import type { SyntaxHighlighterProps } from 'react-syntax-highlighter';
@@ -19,13 +20,15 @@ import { markdown } from '@codemirror/lang-markdown';
 import { sql } from '@codemirror/lang-sql';
 import type { Extension } from '@codemirror/state';
 
-type DiffSource = 'staged' | 'unstaged' | 'untracked';
+type DiffSource = 'staged' | 'unstaged' | 'untracked' | 'committed';
 type DiffLineType = 'context' | 'add' | 'remove' | 'meta';
 type CommentSide = 'old' | 'new';
 type CommentSeverity = 'note' | 'bug' | 'question' | 'nit';
 type CommentStatus = 'open' | 'resolved';
 type AgentKind = 'codex' | 'claude';
-type ActiveTab = 'files' | 'comments' | 'prompt' | `file:${string}`;
+type ActiveTab = 'files' | 'comments' | 'prompt' | `file:${string}` | `commit:${string}`;
+interface CommitLogEntry { hash: string; shortHash: string; author: string; email: string; date: string; relativeDate: string; subject: string; }
+interface CommitDetail { hash: string; shortHash: string; author: string; email: string; date: string; subject: string; body: string; files: DiffFile[]; }
 
 interface SyncStatus { branch: string; upstream: string | null; ahead: number; behind: number; hasRemote: boolean; lastCommit?: { hash: string; subject: string }; }
 interface DiffLine { id: string; type: DiffLineType; raw: string; content: string; oldLine?: number; newLine?: number; }
@@ -81,9 +84,12 @@ export function App() {
   );
   const [showSession, setShowSession] = useState(true);
   const [repoList, setRepoList] = useState<{ path: string; name: string; current: boolean }[]>([]);
-  const [leftTab, setLeftTab] = useState<'files' | 'explorer'>('files');
+  const [leftTab, setLeftTab] = useState<'files' | 'explorer' | 'history'>('files');
   const [openFileTabs, setOpenFileTabs] = useState<{ path: string; content: string }[]>([]);
   const [pendingReveal, setPendingReveal] = useState<{ path: string; line: number; nonce: number } | null>(null);
+  const [commitLog, setCommitLog] = useState<CommitLogEntry[]>([]);
+  const [commitLogLoading, setCommitLogLoading] = useState(false);
+  const [activeCommit, setActiveCommit] = useState<CommitDetail | null>(null);
   const [leftWidth, setLeftWidth] = useState(220);
   const [rightWidth, setRightWidth] = useState(320);
   const workspaceRef = useRef<HTMLElement>(null);
@@ -128,6 +134,12 @@ export function App() {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('pr-theme', theme);
   }, [theme]);
+
+  // Load commit history when the History tab opens or the branch changes.
+  useEffect(() => {
+    if (leftTab === 'history') void loadCommitLog();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leftTab, branches?.current]);
 
   useEffect(() => {
     let inFlight = false;
@@ -181,9 +193,26 @@ export function App() {
     try {
       const r = await api<{ message: string }>(`/api/git/${op}`, { method: 'POST', body: '{}' });
       flash(r.message ? r.message.split('\n')[0].slice(0, 120) : `${op} complete`);
-      await Promise.all([refresh(false), loadSyncStatus()]);
+      await Promise.all([refresh(false), loadSyncStatus(), loadCommitLog()]);
     } catch (e) { setError(msgFor(e)); }
     finally { setSyncing(false); }
+  }
+
+  async function loadCommitLog() {
+    setCommitLogLoading(true);
+    try {
+      const r = await api<{ commits: CommitLogEntry[] }>('/api/git/log?limit=80');
+      setCommitLog(r.commits);
+    } catch (e) { setError(msgFor(e)); }
+    finally { setCommitLogLoading(false); }
+  }
+
+  async function openCommit(hash: string) {
+    try {
+      const detail = await api<CommitDetail>(`/api/git/commit?hash=${encodeURIComponent(hash)}`);
+      setActiveCommit(detail);
+      setActiveTab(`commit:${hash}`);
+    } catch (e) { setError(msgFor(e)); }
   }
 
   async function loadSessionList(selectFirst: boolean) {
@@ -501,6 +530,12 @@ export function App() {
       reveal();
       return;
     }
+    // Images are previewed via <img>, not read as text.
+    if (isImagePath(filePath)) {
+      setOpenFileTabs(prev => [...prev, { path: filePath, content: '' }]);
+      setActiveTab(tabId);
+      return;
+    }
     try {
       const data = await api<{ content: string; path: string }>(`/api/repo/file?path=${encodeURIComponent(filePath)}`);
       setOpenFileTabs(prev => [...prev, { path: filePath, content: data.content }]);
@@ -635,6 +670,9 @@ export function App() {
             <button className={`left-tab${leftTab === 'explorer' ? ' active' : ''}`} onClick={() => setLeftTab('explorer')}>
               Explorer
             </button>
+            <button className={`left-tab${leftTab === 'history' ? ' active' : ''}`} onClick={() => setLeftTab('history')}>
+              History
+            </button>
           </div>
 
           {leftTab === 'files' && (
@@ -700,7 +738,31 @@ export function App() {
           )}
 
           {leftTab === 'explorer' && (
-            <RepoExplorer repoRoot={diff?.repo.repoRoot ?? ''} onOpenFile={(p) => void openFileTab(p)} />
+            <RepoExplorer repoRoot={diff?.repo.repoRoot ?? ''} branch={branches?.current ?? diff?.repo.branch} onOpenFile={(p) => void openFileTab(p)} />
+          )}
+
+          {leftTab === 'history' && (
+            <div className="commit-log">
+              {commitLogLoading && commitLog.length === 0
+                ? <p className="empty-hint">Loading history…</p>
+                : commitLog.length === 0
+                  ? <p className="empty-hint">No commits.</p>
+                  : commitLog.map(c => (
+                    <button
+                      key={c.hash}
+                      className={`commit-row${activeTab === `commit:${c.hash}` ? ' active' : ''}`}
+                      onClick={() => void openCommit(c.hash)}
+                      title={`${c.subject}\n${c.author} · ${c.relativeDate}`}
+                    >
+                      <span className="commit-subject">{c.subject}</span>
+                      <span className="commit-meta">
+                        <span className="commit-hash">{c.shortHash}</span>
+                        <span className="commit-author">{c.author}</span>
+                        <span className="commit-date">{c.relativeDate}</span>
+                      </span>
+                    </button>
+                  ))}
+            </div>
           )}
         </aside>
         <div className="pane-divider" onMouseDown={(e) => startDrag('left', e)} />
@@ -731,12 +793,20 @@ export function App() {
           {activeTab.startsWith('file:') ? (
             <div className="file-editor-content">
               {openFileTabs.map(ft => activeTab === `file:${ft.path}` && (
-                <FileEditor key={ft.path} path={ft.path} content={ft.content}
-                  revealLine={pendingReveal?.path === ft.path ? pendingReveal.line : undefined}
-                  revealNonce={pendingReveal?.path === ft.path ? pendingReveal.nonce : 0}
-                  onJumpSymbol={(name) => void jumpToSymbol(name)}
-                  onChange={(val) => setOpenFileTabs(prev => prev.map(t => t.path === ft.path ? { ...t, content: val } : t))} />
+                isImagePath(ft.path)
+                  ? <div key={ft.path} className="image-preview">
+                      <img src={`/api/repo/raw?path=${encodeURIComponent(ft.path)}`} alt={ft.path} />
+                    </div>
+                  : <FileEditor key={ft.path} path={ft.path} content={ft.content}
+                      revealLine={pendingReveal?.path === ft.path ? pendingReveal.line : undefined}
+                      revealNonce={pendingReveal?.path === ft.path ? pendingReveal.nonce : 0}
+                      onJumpSymbol={(name) => void jumpToSymbol(name)}
+                      onChange={(val) => setOpenFileTabs(prev => prev.map(t => t.path === ft.path ? { ...t, content: val } : t))} />
               ))}
+            </div>
+          ) : activeTab.startsWith('commit:') ? (
+            <div className="center-content">
+              <CommitView detail={activeCommit} onJumpSymbol={(name) => void jumpToSymbol(name)} />
             </div>
           ) : (
           <div className="center-content">
@@ -1167,6 +1237,37 @@ function groupMessages(messages: CodexSessionMessage[]): CodexSessionMessage[][]
   return groups;
 }
 
+// Markdown renderer for chat messages — fenced code blocks get real syntax
+// highlighting instead of plain monospace text.
+const markdownComponents: Components = {
+  code({ className, children, node, ...rest }) {
+    const text = String(children ?? '');
+    const match = /language-(\w+)/.exec(className || '');
+    const isBlock = !!match || text.includes('\n');
+    if (!isBlock) return <code className="md-inline" {...rest}>{children}</code>;
+    const lang = match?.[1] ?? 'text';
+    return (
+      <div className="md-code">
+        <span className="md-code-lang">{lang}</span>
+        <SyntaxHighlighter
+          language={lang}
+          style={oneDark}
+          PreTag="div"
+          customStyle={{ margin: 0, background: 'transparent', padding: '10px 12px', fontSize: 12 }}
+        >
+          {text.replace(/\n$/, '')}
+        </SyntaxHighlighter>
+      </div>
+    );
+  },
+  // The code component renders its own container, so drop react-markdown's <pre> wrapper.
+  pre({ children }) { return <>{children}</>; },
+};
+
+function Markdown({ children }: { children: string }) {
+  return <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>{children}</ReactMarkdown>;
+}
+
 function MessageBubble({ msgs, source }: { msgs: CodexSessionMessage[]; source?: 'codex' | 'claude' }) {
   const first = msgs[0];
   const isUser = first.role === 'user';
@@ -1182,7 +1283,7 @@ function MessageBubble({ msgs, source }: { msgs: CodexSessionMessage[]; source?:
           {msg.text
             ? isUser
               ? <span className="msg-plain">{msg.text}</span>
-              : <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
+              : <Markdown>{msg.text}</Markdown>
             : <em className="msg-empty">(empty)</em>}
         </div>
       ))}
@@ -1219,6 +1320,19 @@ function SessionPanel(props: SessionPanelProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
+
+  // Live elapsed timer while the agent is running (like the Claude Code client).
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const runStartRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!props.agentRunning) return;
+    runStartRef.current = Date.now();
+    setElapsedMs(0);
+    const id = window.setInterval(() => {
+      if (runStartRef.current != null) setElapsedMs(Date.now() - runStartRef.current);
+    }, 200);
+    return () => window.clearInterval(id);
+  }, [props.agentRunning]);
 
   // Detect manual scroll up
   useEffect(() => {
@@ -1313,12 +1427,15 @@ function SessionPanel(props: SessionPanelProps) {
               <div className="msg msg-assistant msg-streaming">
                 <div className="msg-header">
                   <span className="msg-role">{props.activeProvider === 'claude' ? 'Claude' : 'Codex'}</span>
-                  <span className="msg-time">…</span>
+                  <span className="msg-timer" title="Reasoning time">
+                    {props.agentRunning && <span className="msg-timer-dot" />}
+                    {formatElapsed(elapsedMs)}
+                  </span>
                 </div>
                 <div className="msg-body">
                   {props.streamingText
-                    ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{props.streamingText}</ReactMarkdown>
-                    : <span className="thinking-dots"><span/><span/><span/></span>}
+                    ? <Markdown>{props.streamingText}</Markdown>
+                    : <span className="thinking-row"><span className="thinking-dots"><span/><span/><span/></span></span>}
                 </div>
               </div>
             )}
@@ -1428,11 +1545,13 @@ function sortedChildren(dir: FsDir): (FsNode | FsDir)[] {
   );
 }
 
-function RepoExplorer({ repoRoot, onOpenFile }: { repoRoot: string; onOpenFile: (path: string) => void }) {
+function RepoExplorer({ repoRoot, branch, onOpenFile }: { repoRoot: string; branch?: string; onOpenFile: (path: string) => void }) {
   const [tree, setTree] = useState<FsDir | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
 
+  // Reload the tree when the repo OR the branch changes (different branches
+  // track different files).
   useEffect(() => {
     if (!repoRoot) return;
     setLoading(true);
@@ -1440,7 +1559,7 @@ function RepoExplorer({ repoRoot, onOpenFile }: { repoRoot: string; onOpenFile: 
       .then(d => setTree(buildTree(d.files)))
       .catch(() => {})
       .finally(() => setLoading(false));
-  }, [repoRoot]);
+  }, [repoRoot, branch]);
 
   const toggle = (node: FsNode | FsDir) => {
     if (!node.isDir) { onOpenFile(node.path); return; }
@@ -1598,6 +1717,7 @@ interface HighlightedHunkProps {
   hunk: DiffHunk; file: DiffFile; comments: ReviewComment[]; activeTarget?: CommentTarget;
   draftComment: string; draftSeverity: CommentSeverity; editingId?: string;
   editComment: string; editSeverity: CommentSeverity;
+  readOnly?: boolean;
   onJumpSymbol?: (name: string) => void;
   onStartComment: (t: CommentTarget) => void; onCancelDraft: () => void;
   onDraftCommentChange: (v: string) => void; onDraftSeverityChange: (v: CommentSeverity) => void;
@@ -1628,7 +1748,7 @@ function HighlightedHunk(props: HighlightedHunkProps) {
                 <div className="ln old">{line.oldLine ?? ''}</div>
                 <div className="ln new">{line.newLine ?? ''}</div>
                 <div className="line-action">
-                  {target && <button className="comment-btn" title="Add comment" onClick={() => props.onStartComment(target)}>+</button>}
+                  {target && !props.readOnly && <button className="comment-btn" title="Add comment" onClick={() => props.onStartComment(target)}>+</button>}
                 </div>
                 <pre>
                   <span className="diff-pfx">{prefixFor(line)}</span>
@@ -1678,6 +1798,7 @@ interface DiffViewerProps {
   file: DiffFile; comments: ReviewComment[]; activeTarget?: CommentTarget;
   draftComment: string; draftSeverity: CommentSeverity; editingId?: string;
   editComment: string; editSeverity: CommentSeverity;
+  readOnly?: boolean;
   onJumpSymbol?: (name: string) => void;
   onStartComment: (t: CommentTarget) => void; onCancelDraft: () => void;
   onDraftCommentChange: (v: string) => void; onDraftSeverityChange: (v: CommentSeverity) => void;
@@ -1713,6 +1834,7 @@ function DiffViewer(props: DiffViewerProps) {
           file={props.file}
           comments={props.comments}
           activeTarget={props.activeTarget}
+          readOnly={props.readOnly}
           onJumpSymbol={props.onJumpSymbol}
           editingId={props.editingId}
           editComment={props.editComment}
@@ -1734,6 +1856,44 @@ function DiffViewer(props: DiffViewerProps) {
           onSaveDraft={props.onSaveDraft}
         />
       ))}
+    </div>
+  );
+}
+
+// ── Commit detail view (history) ───────────────────────────────────────────────
+
+const NOOP = () => {};
+function CommitView({ detail, onJumpSymbol }: { detail: CommitDetail | null; onJumpSymbol?: (name: string) => void }) {
+  if (!detail) return <div className="empty-state">Loading commit…</div>;
+  const totals = getDiffStats(detail.files);
+  return (
+    <div className="commit-view">
+      <div className="commit-view-header">
+        <div className="commit-view-title">{detail.subject}</div>
+        <div className="commit-view-meta">
+          <span className="commit-hash">{detail.shortHash}</span>
+          <span>{detail.author}</span>
+          {detail.date && <span className="muted">{formatDate(detail.date)}</span>}
+          <span className="adds">+{totals.additions}</span>
+          <span className="dels">−{totals.deletions}</span>
+          <span className="muted">{detail.files.length} files</span>
+        </div>
+        {detail.body && <pre className="commit-view-body">{detail.body}</pre>}
+      </div>
+      {detail.files.length === 0
+        ? <div className="empty-state">No file changes (merge or empty commit).</div>
+        : detail.files.map((file) => (
+          <DiffViewer
+            key={file.id} file={file} comments={[]} readOnly
+            draftComment="" draftSeverity="bug" editComment="" editSeverity="bug"
+            onJumpSymbol={onJumpSymbol}
+            onStartComment={NOOP} onCancelDraft={NOOP}
+            onDraftCommentChange={NOOP} onDraftSeverityChange={NOOP} onSaveDraft={NOOP}
+            onEdit={NOOP} onEditCommentChange={NOOP} onEditSeverityChange={NOOP}
+            onCancelEdit={NOOP} onSaveEdit={NOOP}
+            onResolve={NOOP} onReopen={NOOP} onDelete={NOOP}
+          />
+        ))}
     </div>
   );
 }
@@ -1852,7 +2012,7 @@ function getDiffStats(files: DiffFile[]): DiffStats {
 }
 
 function sourceLabel(s: DiffSource): string {
-  return s === 'staged' ? 'staged' : s === 'untracked' ? 'new' : 'modified';
+  return s === 'staged' ? 'staged' : s === 'untracked' ? 'new' : s === 'committed' ? 'committed' : 'modified';
 }
 
 function shortDate(value: string): string {
@@ -1871,6 +2031,13 @@ function formatDate(value: string): string {
   } catch { return value; }
 }
 
+/** Human-readable elapsed time for the live reasoning timer. */
+function formatElapsed(ms: number): string {
+  const total = Math.floor(ms / 1000);
+  if (total < 60) return `${total}s`;
+  return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, '0')}s`;
+}
+
 const EXT_LANG: Record<string, string> = {
   ts: 'typescript', tsx: 'tsx', js: 'javascript', jsx: 'jsx',
   json: 'json', css: 'css', scss: 'scss', less: 'less',
@@ -1882,6 +2049,11 @@ const EXT_LANG: Record<string, string> = {
   sql: 'sql', graphql: 'graphql', proto: 'protobuf',
   dockerfile: 'docker', makefile: 'makefile',
 };
+
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'avif', 'svg']);
+function isImagePath(filename: string): boolean {
+  return IMAGE_EXTS.has(filename.split('.').pop()?.toLowerCase() ?? '');
+}
 
 function cmLanguage(filename: string): Extension[] {
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';

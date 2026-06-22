@@ -334,16 +334,20 @@ function parseDiffLine(
 export async function listBranches(
   repoRoot: string
 ): Promise<{ current: string; branches: string[] }> {
-  const [branchesResult, currentResult] = await Promise.all([
-    execFileAsync('git', ['branch', '--format=%(refname:short)'], { cwd: repoRoot }),
-    execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repoRoot })
+  // In a fresh repo with no commits, HEAD is unborn and `rev-parse --abbrev-ref
+  // HEAD` errors — fall back to symbolic-ref (which still yields the branch name).
+  const [branchesOut, currentOut] = await Promise.all([
+    gitTry(repoRoot, ['branch', '--format=%(refname:short)']),
+    gitTry(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']).then(
+      (out) => out || gitTry(repoRoot, ['symbolic-ref', '--short', 'HEAD'])
+    ),
   ]);
-  const branches = branchesResult.stdout
+  const branches = branchesOut
     .trim()
     .split('\n')
     .map((b) => b.trim())
     .filter(Boolean);
-  const current = currentResult.stdout.trim() || 'unknown';
+  const current = currentOut.trim() || 'unknown';
   return { current, branches };
 }
 
@@ -402,12 +406,14 @@ async function gitTry(repoRoot: string, args: string[]): Promise<string> {
 }
 
 export async function getSyncStatus(repoRoot: string): Promise<SyncStatus> {
-  const [branch, upstream, remotes, lastCommit] = await Promise.all([
+  const [branchRaw, upstream, remotes, lastCommit] = await Promise.all([
     gitTry(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']),
     gitTry(repoRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']),
     gitTry(repoRoot, ['remote']),
     gitTry(repoRoot, ['log', '-1', '--pretty=%h %s']),
   ]);
+  // Unborn HEAD (no commits) — fall back to the symbolic branch name.
+  const branch = branchRaw || (await gitTry(repoRoot, ['symbolic-ref', '--short', 'HEAD']));
 
   let ahead = 0;
   let behind = 0;
@@ -454,6 +460,65 @@ export async function pullChanges(repoRoot: string): Promise<{ message: string }
 export async function fetchRemote(repoRoot: string): Promise<{ message: string }> {
   const { stdout, stderr } = await execFileAsync('git', ['fetch', '--prune'], { cwd: repoRoot });
   return { message: (stderr || stdout || 'Fetched.').trim() };
+}
+
+// ── Commit history (GitLens-style log) ─────────────────────────────────────────
+
+export interface CommitLogEntry {
+  hash: string;
+  shortHash: string;
+  author: string;
+  email: string;
+  date: string;          // ISO author date
+  relativeDate: string;  // e.g. "3 days ago"
+  subject: string;
+}
+
+const UNIT = '\x1f'; // field separator
+const REC = '\x1e';  // record separator
+
+export async function getCommitLog(repoRoot: string, limit = 60): Promise<CommitLogEntry[]> {
+  const n = Math.max(1, Math.min(Number.isFinite(limit) ? limit : 60, 500));
+  const fmt = ['%H', '%h', '%an', '%ae', '%aI', '%ar', '%s'].join(UNIT) + REC;
+  const out = await gitTry(repoRoot, ['log', `-n${n}`, `--pretty=format:${fmt}`]);
+  if (!out) return [];
+  return out
+    .split(REC)
+    .map((s) => s.replace(/^\r?\n/, '').trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [hash, shortHash, author, email, date, relativeDate, subject] = line.split(UNIT);
+      return { hash, shortHash, author, email, date, relativeDate, subject: subject ?? '' };
+    });
+}
+
+export interface CommitDetail {
+  hash: string;
+  shortHash: string;
+  author: string;
+  email: string;
+  date: string;
+  subject: string;
+  body: string;
+  files: DiffFile[];
+}
+
+export async function getCommitDiff(repoRoot: string, hash: string): Promise<CommitDetail> {
+  const metaFmt = ['%H', '%h', '%an', '%ae', '%aI', '%s', '%b'].join(UNIT);
+  const meta = await gitTry(repoRoot, ['show', '-s', `--pretty=format:${metaFmt}`, hash]);
+  const [h, sh, author, email, date, subject, body] = meta.split(UNIT);
+  // Unified diff of the commit vs its first parent (empty --format suppresses the header).
+  const diff = await gitTry(repoRoot, ['show', hash, '--no-color', '--no-ext-diff', '--format=']);
+  return {
+    hash: h || hash,
+    shortHash: sh || hash.slice(0, 7),
+    author: author ?? '',
+    email: email ?? '',
+    date: date ?? '',
+    subject: subject ?? '',
+    body: (body ?? '').trim(),
+    files: parseUnifiedDiff(diff, 'committed'),
+  };
 }
 
 function stripDiffPath(rawPath: string): string {
