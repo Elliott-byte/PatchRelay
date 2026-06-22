@@ -69,6 +69,7 @@ export function App() {
   const [activeProvider, setActiveProvider] = useState<AgentKind>('claude');
   const [modelList, setModelList] = useState<{ id: string; label: string }[]>([]);
   const [activeModel, setActiveModel] = useState<string>('claude-sonnet-4-6');
+  const [activeEffort, setActiveEffort] = useState<string>(() => localStorage.getItem('pr-effort') ?? 'high');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
@@ -456,7 +457,7 @@ export function App() {
       const res = await fetch(`/api/agent/${kind}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: customMessage, model: activeModel, sessionId: resumingId }),
+        body: JSON.stringify({ message: customMessage, model: activeModel, sessionId: resumingId, effort: activeEffort }),
         signal: ac.signal,
       });
       if (!res.ok || !res.body) {
@@ -884,6 +885,7 @@ export function App() {
             sessionLoading={sessionLoading}
             activeProvider={activeProvider}
             activeModel={activeModel}
+            activeEffort={activeEffort}
             modelList={modelList}
             streamingText={streamingText}
             agentRunning={agentRunning}
@@ -902,6 +904,7 @@ export function App() {
               }
             }}
             onModelChange={setActiveModel}
+            onEffortChange={(e) => { setActiveEffort(e); localStorage.setItem('pr-effort', e); }}
             onSelectSession={selectSession}
             onNewSession={() => void newSession()}
             onRefresh={() => { if (activeSessionId) void loadSession(activeSessionId, { silent: true }); }}
@@ -1300,6 +1303,7 @@ interface SessionPanelProps {
   sessionLoading: boolean;
   activeProvider: AgentKind;
   activeModel: string;
+  activeEffort: string;
   modelList: { id: string; label: string }[];
   streamingText: string;
   agentRunning: boolean;
@@ -1307,9 +1311,80 @@ interface SessionPanelProps {
   onStop: () => void;
   onProviderChange: (p: AgentKind) => void;
   onModelChange: (m: string) => void;
+  onEffortChange: (e: string) => void;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
   onRefresh: () => void;
+}
+
+const EFFORT_OPTIONS: { value: string; label: string }[] = [
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'Extra' },
+  { value: 'max', label: 'Max' },
+];
+
+/** Faster ↔ Smarter reasoning-effort selector (maps to `claude --effort`). Draggable. */
+function EffortSlider({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const last = EFFORT_OPTIONS.length - 1;
+  const idx = Math.max(0, EFFORT_OPTIONS.findIndex(o => o.value === value));
+  const current = EFFORT_OPTIONS[idx] ?? EFFORT_OPTIONS[2];
+
+  const setFromClientX = (clientX: number) => {
+    const el = trackRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - r.left) / r.width));
+    // No "!== value" guard: `value` is captured stale inside the drag closure, so
+    // guarding would block dragging back toward the start. onChange is idempotent.
+    onChange(EFFORT_OPTIONS[Math.round(ratio * last)].value);
+  };
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    e.preventDefault();
+    setFromClientX(e.clientX);
+    const move = (ev: PointerEvent) => setFromClientX(ev.clientX);
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowLeft' && idx > 0) { e.preventDefault(); onChange(EFFORT_OPTIONS[idx - 1].value); }
+    if (e.key === 'ArrowRight' && idx < last) { e.preventDefault(); onChange(EFFORT_OPTIONS[idx + 1].value); }
+  };
+
+  return (
+    <div className="effort-row">
+      <div className="effort-head">
+        <span className="effort-label">Effort <strong>{current.label}</strong></span>
+        <span className="effort-ends"><span>Faster</span><span>Smarter</span></span>
+      </div>
+      <div
+        className="effort-track"
+        ref={trackRef}
+        role="slider"
+        tabIndex={0}
+        aria-valuemin={0}
+        aria-valuemax={last}
+        aria-valuenow={idx}
+        aria-label="Reasoning effort"
+        onPointerDown={onPointerDown}
+        onKeyDown={onKeyDown}
+      >
+        <div className="effort-fill" style={{ width: `${(idx / last) * 100}%` }} />
+        {EFFORT_OPTIONS.map((o, i) => (
+          <span
+            key={o.value}
+            className={`effort-dot${i === idx ? ' active' : ''}${i < idx ? ' passed' : ''}`}
+            style={{ left: `${(i / last) * 100}%` }}
+          />
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function SessionPanel(props: SessionPanelProps) {
@@ -1395,6 +1470,11 @@ function SessionPanel(props: SessionPanelProps) {
           disabled={props.sessionLoading}
         />
       </div>
+
+      {/* Reasoning effort (Claude only) */}
+      {props.activeProvider === 'claude' && (
+        <EffortSlider value={props.activeEffort} onChange={props.onEffortChange} />
+      )}
 
       {/* Meta bar */}
       {activeItem && (
@@ -1602,25 +1682,22 @@ function FileIcon({ name }: { name: string }) {
 }
 
 /**
- * CodeMirror extension: click a symbol to jump to its definition.
- * Uses `click` (after mouseup) and skips when the user is selecting text, so
- * normal editing/selection still works while a plain click navigates.
+ * CodeMirror extension: double-click a symbol to jump to its definition.
+ * Double-click (rather than single) so normal reading/selecting/cursor placement
+ * isn't hijacked. Double-click also naturally selects the word being jumped from.
  */
 function goToDefinition(onJump?: (name: string) => void): Extension {
   return EditorView.domEventHandlers({
-    click(event, view) {
+    dblclick(event, view) {
       if (!onJump) return false;
       const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
       if (pos == null) return false;
-      // Skip if the user dragged out a selection that spans this click point.
-      const sel = view.state.selection.main;
-      if (!sel.empty && pos >= sel.from && pos <= sel.to) return false;
       const word = view.state.wordAt(pos);
       if (!word) return false;
       const name = view.state.sliceDoc(word.from, word.to);
       if (!/^[A-Za-z_$][A-Za-z0-9_$]+$/.test(name)) return false;
       onJump(name);
-      return false; // keep default cursor placement so editing still works
+      return false; // keep the default word-selection
     },
   });
 }
@@ -1676,31 +1753,27 @@ function FileEditor({ path, content, onChange, revealLine, revealNonce, onJumpSy
 
 // ── Syntax-highlighted hunk ───────────────────────────────────────────────────
 
-/** Split text into identifier words; wrap each in a clickable go-to-definition span. */
-function renderJumpableText(text: string, key: string, onJump?: (name: string) => void): React.ReactNode {
-  if (!onJump || !text) return text;
-  // Keep delimiters: identifiers become clickable, everything else stays as text.
-  const parts = text.split(/([A-Za-z_$][A-Za-z0-9_$]+)/);
-  return parts.map((p, i) =>
-    /^[A-Za-z_$][A-Za-z0-9_$]+$/.test(p)
-      ? <span key={`${key}-${i}`} className="tok-id" onClick={() => onJump(p)}>{p}</span>
-      : p
-  );
+/** Double-click a word in a diff to go to its definition (reads the native selection). */
+function jumpFromSelection(onJump?: (name: string) => void) {
+  if (!onJump) return;
+  const sel = window.getSelection?.()?.toString().trim() ?? '';
+  if (/^[A-Za-z_$][A-Za-z0-9_$]+$/.test(sel)) onJump(sel);
 }
 
 /**
  * Recursively render a Prism hast node. Styles are resolved from the highlighter
- * stylesheet by className (the tokens carry classNames, not inline styles), and
- * leaf text is made jumpable so functions in the diff are clickable.
+ * stylesheet by className (the tokens carry classNames, not inline styles).
+ * Note: we do NOT wrap every identifier in its own span — that created thousands
+ * of nodes/handlers and made big diffs laggy. Go-to-definition is handled by a
+ * single double-click listener on the diff card via the native word selection.
  */
 function renderHast(
   node: any,
   key: string,
   stylesheet: Record<string, React.CSSProperties>,
-  useInlineStyles: boolean,
-  onJump?: (name: string) => void
+  useInlineStyles: boolean
 ): React.ReactNode {
-  if (node.type === 'text') return renderJumpableText(node.value ?? '', key, onJump);
+  if (node.type === 'text') return node.value ?? '';
   const classNames: string[] = node.properties?.className ?? [];
   const style = useInlineStyles
     ? Object.assign({}, ...classNames.map((c) => stylesheet[c] ?? {}))
@@ -1708,7 +1781,7 @@ function renderHast(
   const className = !useInlineStyles && classNames.length ? classNames.join(' ') : undefined;
   return (
     <span key={key} style={style} className={className}>
-      {node.children?.map((c: any, i: number) => renderHast(c, `${key}-${i}`, stylesheet, useInlineStyles, onJump))}
+      {node.children?.map((c: any, i: number) => renderHast(c, `${key}-${i}`, stylesheet, useInlineStyles))}
     </span>
   );
 }
@@ -1754,8 +1827,8 @@ function HighlightedHunk(props: HighlightedHunkProps) {
                   <span className="diff-pfx">{prefixFor(line)}</span>
                   {row
                     ? row.children?.map((node: any, j: number) =>
-                        renderHast(node, `t${j}`, stylesheet, useInlineStyles, props.onJumpSymbol))
-                    : renderJumpableText(line.content, 'l', props.onJumpSymbol)}
+                        renderHast(node, `t${j}`, stylesheet, useInlineStyles))
+                    : line.content}
                 </pre>
               </div>
               {lineComments.map((c) => (
@@ -1813,7 +1886,7 @@ function DiffViewer(props: DiffViewerProps) {
   const stats = getFileStats(props.file);
   const fc = props.comments.filter((c) => commentMatchesFile(c, props.file));
   return (
-    <div className="diff-card">
+    <div className="diff-card" onDoubleClick={props.onJumpSymbol ? () => jumpFromSelection(props.onJumpSymbol) : undefined}>
       <div className="diff-card-header">
         <div className="file-heading">
           <FileIcon name={displayPath(props.file)} />

@@ -301,7 +301,7 @@ async function handleApiRequest(
 
   if (method === 'POST' && (pathName === '/api/agent/codex' || pathName === '/api/agent/claude')) {
     const kind: AgentKind = pathName.endsWith('/codex') ? 'codex' : 'claude';
-    const { message, model, sessionId } = await readJson<{ message?: string; model?: string; sessionId?: string }>(req);
+    const { message, model, sessionId, effort } = await readJson<{ message?: string; model?: string; sessionId?: string; effort?: string }>(req);
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -313,7 +313,7 @@ async function handleApiRequest(
     req.on('close', () => { if (!res.writableEnded) ac.abort(); });
     const result = await runAgent(repoRoot, kind, message, model, sessionId, (chunk) => {
       res.write(`data: ${JSON.stringify({ type: 'chunk', text: chunk })}\n\n`);
-    }, ac.signal);
+    }, ac.signal, effort);
     if (!res.writableEnded) {
       res.write(`data: ${JSON.stringify({ type: 'done', success: result.success, error: result.error, stderr: result.stderr })}\n\n`);
       res.end();
@@ -542,7 +542,9 @@ async function generateCommitMessage(repoRoot: string): Promise<string> {
   return line.replace(/^["'`]+|["'`]+$/g, '').trim();
 }
 
-async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: string, model?: string, sessionId?: string, onChunk?: (text: string) => void, signal?: AbortSignal) {
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: string, model?: string, sessionId?: string, onChunk?: (text: string) => void, signal?: AbortSignal, effort?: string) {
   const config = await loadConfig(repoRoot);
   const [diff, comments] = await Promise.all([
     getDiffResponse(repoRoot, config),
@@ -559,6 +561,8 @@ async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: strin
       if (model) command = `${command} --model ${model}`;
       command = `${command} --system-prompt ${JSON.stringify(systemPrompt)}`;
     }
+    // Reasoning effort (low|medium|high|xhigh|max) — applies to new and resumed turns.
+    if (effort && EFFORT_LEVELS.has(effort)) command = `${command} --effort ${effort}`;
     console.error('[PatchRelay] claude command:', command);
     const chunkHandler = command.includes('--output-format stream-json')
       ? makeStreamJsonChunkHandler(onChunk)
