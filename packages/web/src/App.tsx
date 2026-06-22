@@ -27,6 +27,7 @@ type CommentStatus = 'open' | 'resolved';
 type AgentKind = 'codex' | 'claude';
 type ActiveTab = 'files' | 'comments' | 'prompt' | `file:${string}`;
 
+interface SyncStatus { branch: string; upstream: string | null; ahead: number; behind: number; hasRemote: boolean; lastCommit?: { hash: string; subject: string }; }
 interface DiffLine { id: string; type: DiffLineType; raw: string; content: string; oldLine?: number; newLine?: number; }
 interface DiffHunk { id: string; header: string; oldStart: number; oldLines: number; newStart: number; newLines: number; lines: DiffLine[]; }
 interface DiffFile { id: string; source: DiffSource; oldPath: string; newPath: string; hunks: DiffHunk[]; }
@@ -73,6 +74,8 @@ export function App() {
   const [branchSwitching, setBranchSwitching] = useState(false);
   const [commitMessage, setCommitMessage] = useState('');
   const [generatingMsg, setGeneratingMsg] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [syncing, setSyncing] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>(
     () => (localStorage.getItem('pr-theme') as 'dark' | 'light') ?? 'dark'
   );
@@ -161,11 +164,26 @@ export function App() {
       setSelectedFileId((cur) =>
         cur && nextDiff.files.some((f) => f.id === cur) ? cur : nextDiff.files[0]?.id
       );
+      void loadSyncStatus();
     } catch (e) {
       setError(msgFor(e));
     } finally {
       if (showBusy) setBusy(false);
     }
+  }
+
+  async function loadSyncStatus() {
+    try { setSyncStatus(await api<SyncStatus>('/api/git/sync-status')); } catch { /* non-fatal */ }
+  }
+
+  async function gitSync(op: 'push' | 'pull' | 'fetch') {
+    setSyncing(true);
+    try {
+      const r = await api<{ message: string }>(`/api/git/${op}`, { method: 'POST', body: '{}' });
+      flash(r.message ? r.message.split('\n')[0].slice(0, 120) : `${op} complete`);
+      await Promise.all([refresh(false), loadSyncStatus()]);
+    } catch (e) { setError(msgFor(e)); }
+    finally { setSyncing(false); }
   }
 
   async function loadSessionList(selectFirst: boolean) {
@@ -656,6 +674,27 @@ export function App() {
                   </button>
                 </div>
                 {!hasStagedChanges && !!diff?.files.length && <p className="commit-hint">Stage files to commit.</p>}
+
+                {/* Remote sync — push / pull / fetch + ahead-behind */}
+                <div className="sync-bar">
+                  <div className="sync-status">
+                    {!syncStatus?.hasRemote ? <span className="muted">no remote</span>
+                      : !syncStatus.upstream ? <span className="muted">no upstream — Push to set</span>
+                      : (syncStatus.ahead === 0 && syncStatus.behind === 0)
+                        ? <span className="sync-clean" title={syncStatus.upstream}>✓ {syncStatus.upstream}</span>
+                        : (
+                          <span className="sync-counts" title={syncStatus.upstream}>
+                            {syncStatus.behind > 0 && <span className="sync-behind">↓{syncStatus.behind}</span>}
+                            {syncStatus.ahead > 0 && <span className="sync-ahead">↑{syncStatus.ahead}</span>}
+                          </span>
+                        )}
+                  </div>
+                  <div className="sync-actions">
+                    <button className="sync-btn" onClick={() => void gitSync('pull')} disabled={syncing || !syncStatus?.upstream} title="Pull">⤓{syncStatus?.behind ? ` ${syncStatus.behind}` : ''}</button>
+                    <button className="sync-btn" onClick={() => void gitSync('fetch')} disabled={syncing || !syncStatus?.hasRemote} title="Fetch">⟳</button>
+                    <button className="sync-btn sync-push" onClick={() => void gitSync('push')} disabled={syncing || !syncStatus?.hasRemote} title="Push">⤒{syncStatus?.ahead ? ` ${syncStatus.ahead}` : ''}</button>
+                  </div>
+                </div>
               </div>
             </>
           )}

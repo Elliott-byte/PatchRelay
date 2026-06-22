@@ -805,6 +805,41 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 .commit-btn:hover:not(:disabled) { background: rgba(48,209,88,0.22); }
 .commit-hint { color: var(--text-muted); font-size: 11px; margin: 0; text-align: center; }
 
+/* Remote sync bar (push / pull / fetch) */
+.sync-bar {
+  align-items: center;
+  border-top: 1px solid var(--glass-border);
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  margin-top: 2px;
+  padding-top: 10px;
+}
+.sync-status { font-size: 11px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sync-clean { color: var(--text-2); }
+.sync-counts { align-items: center; display: inline-flex; gap: 6px; }
+.sync-behind { color: var(--yellow); font-weight: 600; }
+.sync-ahead { color: var(--green); font-weight: 600; }
+.sync-actions { display: flex; flex: 0 0 auto; gap: 4px; }
+.sync-btn {
+  align-items: center;
+  background: var(--glass);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-xs);
+  color: var(--text);
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 600;
+  gap: 2px;
+  justify-content: center;
+  min-width: 28px;
+  padding: 4px 8px;
+  transition: background 0.12s, border-color 0.12s;
+}
+.sync-btn:hover:not(:disabled) { background: var(--glass-hover); }
+.sync-btn.sync-push { background: var(--accent-dim); border-color: rgba(10,132,255,0.3); color: var(--accent); }
+.sync-btn.sync-push:hover:not(:disabled) { background: var(--accent-glow); }
+
 /* ── Center pane ──────────────────────────────────── */
 .center-pane {
   display: flex;

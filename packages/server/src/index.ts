@@ -16,13 +16,17 @@ import {
   commitChanges,
   createComment,
   deleteComment,
+  fetchRemote,
   getCodexSession,
   getDiffResponse,
   getSessionById,
+  getSyncStatus,
   listAllSessions,
   listBranches,
   listComments,
   loadConfig,
+  pullChanges,
+  pushChanges,
   runAgentCommand,
   saveConfig,
   stageFiles,
@@ -238,6 +242,24 @@ async function handleApiRequest(
     const { message } = await readJson<{ message: string }>(req);
     const result = await commitChanges(repoRoot, message);
     sendJson(res, 200, result);
+    return;
+  }
+
+  if (method === 'GET' && pathName === '/api/git/sync-status') {
+    sendJson(res, 200, await getSyncStatus(repoRoot));
+    return;
+  }
+
+  if (method === 'POST' && (pathName === '/api/git/push' || pathName === '/api/git/pull' || pathName === '/api/git/fetch')) {
+    try {
+      const op = pathName === '/api/git/push' ? pushChanges : pathName === '/api/git/pull' ? pullChanges : fetchRemote;
+      const result = await op(repoRoot);
+      sendJson(res, 200, result);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // git writes failures to stderr; surface a readable line
+      sendJson(res, 400, { error: msg.split('\n').slice(-6).join('\n').trim() || 'Git operation failed.' });
+    }
     return;
   }
 

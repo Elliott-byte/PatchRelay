@@ -381,6 +381,81 @@ export async function commitChanges(
   return { hash: stdout.trim() };
 }
 
+// ── Remote sync (push / pull / fetch / ahead-behind) ───────────────────────────
+
+export interface SyncStatus {
+  branch: string;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  hasRemote: boolean;
+  lastCommit?: { hash: string; subject: string };
+}
+
+async function gitTry(repoRoot: string, args: string[]): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('git', args, { cwd: repoRoot });
+    return stdout.trim();
+  } catch {
+    return '';
+  }
+}
+
+export async function getSyncStatus(repoRoot: string): Promise<SyncStatus> {
+  const [branch, upstream, remotes, lastCommit] = await Promise.all([
+    gitTry(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    gitTry(repoRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']),
+    gitTry(repoRoot, ['remote']),
+    gitTry(repoRoot, ['log', '-1', '--pretty=%h %s']),
+  ]);
+
+  let ahead = 0;
+  let behind = 0;
+  if (upstream) {
+    const counts = await gitTry(repoRoot, ['rev-list', '--count', '--left-right', `${upstream}...HEAD`]);
+    const m = counts.match(/(\d+)\s+(\d+)/);
+    if (m) { behind = Number(m[1]); ahead = Number(m[2]); }
+  }
+
+  const sp = lastCommit.indexOf(' ');
+  const hash = sp === -1 ? lastCommit : lastCommit.slice(0, sp);
+  const subject = sp === -1 ? '' : lastCommit.slice(sp + 1);
+  return {
+    branch: branch || 'unknown',
+    upstream: upstream || null,
+    ahead,
+    behind,
+    hasRemote: remotes.split('\n').filter(Boolean).length > 0,
+    lastCommit: hash ? { hash, subject } : undefined,
+  };
+}
+
+export async function pushChanges(repoRoot: string): Promise<{ message: string }> {
+  const upstream = await gitTry(repoRoot, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
+  let args: string[];
+  if (upstream) {
+    args = ['push'];
+  } else {
+    const branch = await gitTry(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    const remotes = (await gitTry(repoRoot, ['remote'])).split('\n').filter(Boolean);
+    if (!remotes.length) throw new Error('No git remote configured. Add one with `git remote add origin <url>`.');
+    const remote = remotes.includes('origin') ? 'origin' : remotes[0];
+    args = ['push', '--set-upstream', remote, branch];
+  }
+  const { stdout, stderr } = await execFileAsync('git', args, { cwd: repoRoot });
+  return { message: (stderr || stdout || 'Pushed.').trim() };
+}
+
+export async function pullChanges(repoRoot: string): Promise<{ message: string }> {
+  const { stdout, stderr } = await execFileAsync('git', ['pull'], { cwd: repoRoot });
+  return { message: (stdout || stderr || 'Pulled.').trim() };
+}
+
+export async function fetchRemote(repoRoot: string): Promise<{ message: string }> {
+  const { stdout, stderr } = await execFileAsync('git', ['fetch', '--prune'], { cwd: repoRoot });
+  return { message: (stderr || stdout || 'Fetched.').trim() };
+}
+
 function stripDiffPath(rawPath: string): string {
   if (rawPath === '/dev/null') {
     return rawPath;
