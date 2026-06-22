@@ -10,13 +10,18 @@
     "packages/cli"
   ],
   "scripts": {
+    "start": "npm run build && node packages/cli/dist/index.js",
     "build": "npm run build -w @patchrelay/core && npm run build -w @patchrelay/server && npm run build -w @patchrelay/web && npm run build -w @patchrelay/cli",
     "typecheck": "npm run build -w @patchrelay/core && npm run build -w @patchrelay/server && npm run typecheck -w @patchrelay/web && npm run typecheck -w @patchrelay/cli",
     "patchrelay": "npm run start -w @patchrelay/cli --",
+    "dev": "concurrently -n api,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch --tsconfig tsconfig.dev.json scripts/dev-server.ts",
     "dev:web": "npm run dev -w @patchrelay/web"
   },
   "devDependencies": {
     "@types/node": "^20.14.10",
+    "concurrently": "^9.2.3",
+    "tsx": "^4.22.4",
     "typescript": "^5.5.3"
   }
 }

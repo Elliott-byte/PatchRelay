@@ -4,8 +4,9 @@ import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import type { SyntaxHighlighterProps } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import CodeMirror from '@uiw/react-codemirror';
+import CodeMirror, { EditorView } from '@uiw/react-codemirror';
 import { oneDark as cmOneDark } from '@codemirror/theme-one-dark';
+import { getIcon } from 'material-file-icons';
 import { javascript } from '@codemirror/lang-javascript';
 import { python } from '@codemirror/lang-python';
 import { rust } from '@codemirror/lang-rust';
@@ -71,6 +72,7 @@ export function App() {
   const [branches, setBranches] = useState<BranchInfo | undefined>();
   const [branchSwitching, setBranchSwitching] = useState(false);
   const [commitMessage, setCommitMessage] = useState('');
+  const [generatingMsg, setGeneratingMsg] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>(
     () => (localStorage.getItem('pr-theme') as 'dark' | 'light') ?? 'dark'
   );
@@ -78,6 +80,7 @@ export function App() {
   const [repoList, setRepoList] = useState<{ path: string; name: string; current: boolean }[]>([]);
   const [leftTab, setLeftTab] = useState<'files' | 'explorer'>('files');
   const [openFileTabs, setOpenFileTabs] = useState<{ path: string; content: string }[]>([]);
+  const [pendingReveal, setPendingReveal] = useState<{ path: string; line: number; nonce: number } | null>(null);
   const [leftWidth, setLeftWidth] = useState(220);
   const [rightWidth, setRightWidth] = useState(320);
   const workspaceRef = useRef<HTMLElement>(null);
@@ -142,7 +145,9 @@ export function App() {
 
   const openComments = comments.filter((c) => c.status === 'open');
   const totalStats = useMemo(() => getDiffStats(diff?.files ?? []), [diff]);
-  const hasStagedChanges = diff?.files.some((f) => f.source === 'staged') ?? false;
+  const stagedFiles = useMemo(() => diff?.files.filter((f) => f.source === 'staged') ?? [], [diff]);
+  const unstagedFiles = useMemo(() => diff?.files.filter((f) => f.source !== 'staged') ?? [], [diff]);
+  const hasStagedChanges = stagedFiles.length > 0;
 
   async function refresh(showBusy = true) {
     if (showBusy) { setBusy(true); setError(''); }
@@ -298,6 +303,55 @@ export function App() {
     finally { setBusy(false); }
   }
 
+  // Stage/unstage every file in a group at once.
+  async function stageAll(files: DiffFile[], stage: boolean) {
+    if (!files.length) return;
+    try {
+      await api(`/api/git/${stage ? 'stage' : 'unstage'}`, {
+        method: 'POST', body: JSON.stringify({ files: files.map(displayPath) })
+      });
+      await refresh(false);
+    } catch (e) { setError(msgFor(e)); }
+  }
+
+  // Ask the agent to write a commit message from the staged diff.
+  async function generateMessage(): Promise<string | undefined> {
+    if (!hasStagedChanges) { flash('Stage files first.'); return; }
+    setGeneratingMsg(true);
+    try {
+      const r = await api<{ message: string }>('/api/git/commit-message', { method: 'POST', body: '{}' });
+      if (r.message) setCommitMessage(r.message);
+      return r.message;
+    } catch (e) { setError(msgFor(e)); }
+    finally { setGeneratingMsg(false); }
+  }
+
+  const renderFileRow = (file: DiffFile) => {
+    const fs = getFileStats(file);
+    const fc = comments.filter((c) => commentMatchesFile(c, file));
+    const isActive = file.id === selectedFile?.id;
+    const staged = file.source === 'staged';
+    const path = displayPath(file);
+    return (
+      <div key={file.id} className={`file-row${isActive ? ' active' : ''}`}>
+        <button
+          className={`stage-toggle${staged ? ' staged' : ''}`}
+          title={staged ? 'Unstage' : 'Stage'}
+          onClick={() => staged ? void unstageFile(file) : void stageFile(file)}
+        >{staged ? '✓' : '+'}</button>
+        <button className="file-row-label" onClick={() => { setSelectedFileId(file.id); setActiveTab('files'); }}>
+          <span className="file-name"><FileIcon name={path} />{path.split('/').pop()}</span>
+          <span className="file-meta">
+            <span className="file-dir">{path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ''}</span>
+            <span className="adds">+{fs.additions}</span>
+            <span className="dels">−{fs.deletions}</span>
+            {fc.length ? <span className="comment-count">💬 {fc.length}</span> : null}
+          </span>
+        </button>
+      </div>
+    );
+  };
+
   async function saveDraft() {
     if (!activeTarget || !draftComment.trim()) return;
     const saved = await api<ReviewComment>('/api/comments', {
@@ -421,16 +475,34 @@ export function App() {
     }, 600);
   }
 
-  async function openFileTab(filePath: string) {
+  async function openFileTab(filePath: string, revealLine?: number) {
     const tabId: ActiveTab = `file:${filePath}`;
+    const reveal = () => { if (revealLine) setPendingReveal({ path: filePath, line: revealLine, nonce: Date.now() }); };
     if (openFileTabs.find(t => t.path === filePath)) {
       setActiveTab(tabId);
+      reveal();
       return;
     }
     try {
       const data = await api<{ content: string; path: string }>(`/api/repo/file?path=${encodeURIComponent(filePath)}`);
       setOpenFileTabs(prev => [...prev, { path: filePath, content: data.content }]);
       setActiveTab(tabId);
+      reveal();
+    } catch (e) {
+      setError(msgFor(e));
+    }
+  }
+
+  // Go-to-definition: resolve a symbol to its definition site and jump there.
+  async function jumpToSymbol(name: string) {
+    try {
+      const d = await api<{ matches: { path: string; line: number; text: string }[] }>(
+        `/api/repo/definition?name=${encodeURIComponent(name)}`
+      );
+      const hit = d.matches[0];
+      if (!hit) { flash(`No definition found for "${name}"`); return; }
+      setLeftTab('explorer');
+      await openFileTab(hit.path, hit.line);
     } catch (e) {
       setError(msgFor(e));
     }
@@ -550,37 +622,39 @@ export function App() {
           {leftTab === 'files' && (
             <>
               <div className="file-list">
-                {diff?.files.length ? diff.files.map((file) => {
-                  const fs = getFileStats(file);
-                  const fc = comments.filter((c) => commentMatchesFile(c, file));
-                  const isActive = file.id === selectedFile?.id;
-                  return (
-                    <div key={file.id} className={`file-row${isActive ? ' active' : ''}`}>
-                      <button className="file-row-label" onClick={() => { setSelectedFileId(file.id); setActiveTab('files'); }}>
-                        <span className="file-name">{displayPath(file)}</span>
-                        <span className="file-meta">
-                          <span className={`src-badge src-${file.source}`}>{sourceLabel(file.source)}</span>
-                          <span className="adds">+{fs.additions}</span>
-                          <span className="dels">−{fs.deletions}</span>
-                          {fc.length ? <span className="comment-count">💬 {fc.length}</span> : null}
-                        </span>
-                      </button>
-                      <button
-                        className={`stage-btn ${file.source === 'staged' ? 'unstage' : 'stage'}`}
-                        title={file.source === 'staged' ? 'Unstage' : 'Stage'}
-                        onClick={() => file.source === 'staged' ? void unstageFile(file) : void stageFile(file)}
-                      >
-                        {file.source === 'staged' ? '−' : '+'}
-                      </button>
-                    </div>
-                  );
-                }) : <p className="empty-hint">No local diff.</p>}
+                {diff?.files.length ? (
+                  <>
+                    {stagedFiles.length > 0 && (
+                      <div className="file-group">
+                        <div className="file-group-header">
+                          <span className="file-group-title">Staged <span className="count-badge">{stagedFiles.length}</span></span>
+                          <button className="group-action" onClick={() => void stageAll(stagedFiles, false)}>Unstage all</button>
+                        </div>
+                        {stagedFiles.map(renderFileRow)}
+                      </div>
+                    )}
+                    {unstagedFiles.length > 0 && (
+                      <div className="file-group">
+                        <div className="file-group-header">
+                          <span className="file-group-title">Changes <span className="count-badge">{unstagedFiles.length}</span></span>
+                          <button className="group-action" onClick={() => void stageAll(unstagedFiles, true)}>Stage all</button>
+                        </div>
+                        {unstagedFiles.map(renderFileRow)}
+                      </div>
+                    )}
+                  </>
+                ) : <p className="empty-hint">No local diff.</p>}
               </div>
               <div className="commit-panel">
                 <textarea className="commit-input" value={commitMessage} onChange={(e) => setCommitMessage(e.target.value)} placeholder="Commit message…" rows={3} />
-                <button className="commit-btn" onClick={() => void commit()} disabled={busy || !commitMessage.trim() || !hasStagedChanges}>
-                  Commit staged
-                </button>
+                <div className="commit-actions">
+                  <button className="commit-gen-btn" onClick={() => void generateMessage()} disabled={generatingMsg || busy || !hasStagedChanges} title="Generate a commit message from staged changes">
+                    {generatingMsg ? 'Generating…' : '✨ Generate'}
+                  </button>
+                  <button className="commit-btn" onClick={() => void commit()} disabled={busy || generatingMsg || !commitMessage.trim() || !hasStagedChanges}>
+                    Commit
+                  </button>
+                </div>
                 {!hasStagedChanges && !!diff?.files.length && <p className="commit-hint">Stage files to commit.</p>}
               </div>
             </>
@@ -594,6 +668,38 @@ export function App() {
 
         {/* Center: diff + floating chat */}
         <section className="center-pane" aria-label="Main panel">
+          {/* File tabs — at the top, like a normal editor (when any file is open) */}
+          {openFileTabs.length > 0 && (
+            <div className="file-tab-bar">
+              <button
+                className={`file-tab-home${!activeTab.startsWith('file:') ? ' active' : ''}`}
+                onClick={() => setActiveTab('files')}
+                title="Back to changes"
+              >Changes</button>
+              {openFileTabs.map(ft => (
+                <span key={ft.path} className={`file-tab${activeTab === `file:${ft.path}` ? ' active' : ''}`}>
+                  <button className="file-tab-label" onClick={() => setActiveTab(`file:${ft.path}`)}>
+                    <FileIcon name={ft.path} />
+                    {ft.path.split('/').pop()}
+                  </button>
+                  <button className="file-tab-close" onClick={() => closeFileTab(ft.path)} title="Close">×</button>
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* Stage: file editor when a file tab is active, otherwise the diff/comments/prompt */}
+          {activeTab.startsWith('file:') ? (
+            <div className="file-editor-content">
+              {openFileTabs.map(ft => activeTab === `file:${ft.path}` && (
+                <FileEditor key={ft.path} path={ft.path} content={ft.content}
+                  revealLine={pendingReveal?.path === ft.path ? pendingReveal.line : undefined}
+                  revealNonce={pendingReveal?.path === ft.path ? pendingReveal.nonce : 0}
+                  onJumpSymbol={(name) => void jumpToSymbol(name)}
+                  onChange={(val) => setOpenFileTabs(prev => prev.map(t => t.path === ft.path ? { ...t, content: val } : t))} />
+              ))}
+            </div>
+          ) : (
           <div className="center-content">
             {activeTab === 'files' && (
               <>
@@ -606,6 +712,7 @@ export function App() {
                   <DiffViewer file={selectedFile} comments={comments} activeTarget={activeTarget}
                     draftComment={draftComment} draftSeverity={draftSeverity} editingId={editingId}
                     editComment={editComment} editSeverity={editSeverity}
+                    onJumpSymbol={(name) => void jumpToSymbol(name)}
                     onStartComment={(t) => { setActiveTarget(t); setDraftComment(''); setDraftSeverity('bug'); }}
                     onCancelDraft={() => setActiveTarget(undefined)}
                     onDraftCommentChange={setDraftComment} onDraftSeverityChange={setDraftSeverity}
@@ -645,8 +752,9 @@ export function App() {
               </div>
             )}
           </div>
+          )}
 
-          {/* Floating chat compose — inside center-content so it doesn't overlay the file editor */}
+          {/* Bottom: floating chat compose — flex footer, always centered at the bottom */}
           <FloatingCompose
             busy={busy}
             openComments={openComments}
@@ -1312,9 +1420,12 @@ function RepoExplorer({ repoRoot, onOpenFile }: { repoRoot: string; onOpenFile: 
           style={{ paddingLeft: depth * 14 + 8 }}
           onClick={() => toggle(node)}
         >
-          <span className="explorer-icon">
-            {node.isDir ? (expanded.has(node.path) ? '▾' : '▸') : '·'}
+          <span className="explorer-chevron">
+            {node.isDir ? (expanded.has(node.path) ? '▾' : '▸') : ''}
           </span>
+          {node.isDir
+            ? <span className="explorer-icon explorer-folder">{expanded.has(node.path) ? '📂' : '📁'}</span>
+            : <FileIcon name={node.name} />}
           <span className="explorer-name">{node.name}</span>
         </button>
         {node.isDir && expanded.has(node.path) && renderDir(node as FsDir, depth + 1)}
@@ -1326,14 +1437,79 @@ function RepoExplorer({ repoRoot, onOpenFile }: { repoRoot: string; onOpenFile: 
   return <div className="explorer-tree">{renderDir(tree, 0)}</div>;
 }
 
-function FileEditor({ path, content, onChange }: { path: string; content: string; onChange: (v: string) => void }) {
-  const extensions = useMemo(() => cmLanguage(path), [path]);
+/** Renders the inline material SVG icon for a filename. */
+function FileIcon({ name }: { name: string }) {
+  const svg = useMemo(() => getIcon(name).svg, [name]);
+  return <span className="mfi" aria-hidden dangerouslySetInnerHTML={{ __html: svg }} />;
+}
+
+/**
+ * CodeMirror extension: click a symbol to jump to its definition.
+ * Uses `click` (after mouseup) and skips when the user is selecting text, so
+ * normal editing/selection still works while a plain click navigates.
+ */
+function goToDefinition(onJump?: (name: string) => void): Extension {
+  return EditorView.domEventHandlers({
+    click(event, view) {
+      if (!onJump) return false;
+      const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+      if (pos == null) return false;
+      // Skip if the user dragged out a selection that spans this click point.
+      const sel = view.state.selection.main;
+      if (!sel.empty && pos >= sel.from && pos <= sel.to) return false;
+      const word = view.state.wordAt(pos);
+      if (!word) return false;
+      const name = view.state.sliceDoc(word.from, word.to);
+      if (!/^[A-Za-z_$][A-Za-z0-9_$]+$/.test(name)) return false;
+      onJump(name);
+      return false; // keep default cursor placement so editing still works
+    },
+  });
+}
+
+interface FileEditorProps {
+  path: string;
+  content: string;
+  onChange: (v: string) => void;
+  revealLine?: number;
+  revealNonce?: number;
+  onJumpSymbol?: (name: string) => void;
+}
+
+function FileEditor({ path, content, onChange, revealLine, revealNonce, onJumpSymbol }: FileEditorProps) {
+  const viewRef = useRef<EditorView | null>(null);
+  const extensions = useMemo(() => [...cmLanguage(path), goToDefinition(onJumpSymbol)], [path, onJumpSymbol]);
+
+  // Scroll to + highlight the target line whenever a reveal is requested.
+  // A freshly-mounted editor hasn't measured its layout yet, so scrolling once
+  // lands in the wrong place — run after two animation frames so geometry exists.
+  useEffect(() => {
+    if (!revealLine) return;
+    let raf2 = 0;
+    const doReveal = () => {
+      const view = viewRef.current;
+      if (!view) return;
+      const lineNo = Math.min(Math.max(revealLine, 1), view.state.doc.lines);
+      const info = view.state.doc.line(lineNo);
+      // Collapsed cursor (not a range) so the active-line highlight shows but a
+      // later plain click isn't mistaken for a drag-selection by goToDefinition.
+      view.dispatch({
+        selection: { anchor: info.from },
+        effects: EditorView.scrollIntoView(info.from, { y: 'center' }),
+      });
+      view.focus();
+    };
+    const raf1 = requestAnimationFrame(() => { doReveal(); raf2 = requestAnimationFrame(doReveal); });
+    return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); };
+  }, [revealLine, revealNonce]);
+
   return (
     <CodeMirror
       value={content}
       extensions={extensions}
       theme={cmOneDark}
       onChange={onChange}
+      onCreateEditor={(view) => { viewRef.current = view; }}
       style={{ height: '100%', fontSize: 13 }}
       height="100%"
     />
@@ -1342,10 +1518,48 @@ function FileEditor({ path, content, onChange }: { path: string; content: string
 
 // ── Syntax-highlighted hunk ───────────────────────────────────────────────────
 
+/** Split text into identifier words; wrap each in a clickable go-to-definition span. */
+function renderJumpableText(text: string, key: string, onJump?: (name: string) => void): React.ReactNode {
+  if (!onJump || !text) return text;
+  // Keep delimiters: identifiers become clickable, everything else stays as text.
+  const parts = text.split(/([A-Za-z_$][A-Za-z0-9_$]+)/);
+  return parts.map((p, i) =>
+    /^[A-Za-z_$][A-Za-z0-9_$]+$/.test(p)
+      ? <span key={`${key}-${i}`} className="tok-id" onClick={() => onJump(p)}>{p}</span>
+      : p
+  );
+}
+
+/**
+ * Recursively render a Prism hast node. Styles are resolved from the highlighter
+ * stylesheet by className (the tokens carry classNames, not inline styles), and
+ * leaf text is made jumpable so functions in the diff are clickable.
+ */
+function renderHast(
+  node: any,
+  key: string,
+  stylesheet: Record<string, React.CSSProperties>,
+  useInlineStyles: boolean,
+  onJump?: (name: string) => void
+): React.ReactNode {
+  if (node.type === 'text') return renderJumpableText(node.value ?? '', key, onJump);
+  const classNames: string[] = node.properties?.className ?? [];
+  const style = useInlineStyles
+    ? Object.assign({}, ...classNames.map((c) => stylesheet[c] ?? {}))
+    : undefined;
+  const className = !useInlineStyles && classNames.length ? classNames.join(' ') : undefined;
+  return (
+    <span key={key} style={style} className={className}>
+      {node.children?.map((c: any, i: number) => renderHast(c, `${key}-${i}`, stylesheet, useInlineStyles, onJump))}
+    </span>
+  );
+}
+
 interface HighlightedHunkProps {
   hunk: DiffHunk; file: DiffFile; comments: ReviewComment[]; activeTarget?: CommentTarget;
   draftComment: string; draftSeverity: CommentSeverity; editingId?: string;
   editComment: string; editSeverity: CommentSeverity;
+  onJumpSymbol?: (name: string) => void;
   onStartComment: (t: CommentTarget) => void; onCancelDraft: () => void;
   onDraftCommentChange: (v: string) => void; onDraftSeverityChange: (v: CommentSeverity) => void;
   onSaveDraft: () => void; onEdit: (c: ReviewComment) => void;
@@ -1379,15 +1593,10 @@ function HighlightedHunk(props: HighlightedHunkProps) {
                 </div>
                 <pre>
                   <span className="diff-pfx">{prefixFor(line)}</span>
-                  {row ? row.children?.map((token: any, j: number) => {
-                    const style = useInlineStyles && token.properties?.style
-                      ? (typeof token.properties.style === 'object' ? token.properties.style : {})
-                      : {};
-                    const cls = (!useInlineStyles && token.properties?.className)
-                      ? (Array.isArray(token.properties.className) ? token.properties.className.join(' ') : token.properties.className)
-                      : undefined;
-                    return <span key={j} style={style} className={cls}>{token.children?.[0]?.value ?? ''}</span>;
-                  }) : line.content}
+                  {row
+                    ? row.children?.map((node: any, j: number) =>
+                        renderHast(node, `t${j}`, stylesheet, useInlineStyles, props.onJumpSymbol))
+                    : renderJumpableText(line.content, 'l', props.onJumpSymbol)}
                 </pre>
               </div>
               {lineComments.map((c) => (
@@ -1430,6 +1639,7 @@ interface DiffViewerProps {
   file: DiffFile; comments: ReviewComment[]; activeTarget?: CommentTarget;
   draftComment: string; draftSeverity: CommentSeverity; editingId?: string;
   editComment: string; editSeverity: CommentSeverity;
+  onJumpSymbol?: (name: string) => void;
   onStartComment: (t: CommentTarget) => void; onCancelDraft: () => void;
   onDraftCommentChange: (v: string) => void; onDraftSeverityChange: (v: CommentSeverity) => void;
   onSaveDraft: () => void; onEdit: (c: ReviewComment) => void;
@@ -1446,7 +1656,7 @@ function DiffViewer(props: DiffViewerProps) {
     <div className="diff-card">
       <div className="diff-card-header">
         <div className="file-heading">
-          <span className="file-icon" />
+          <FileIcon name={displayPath(props.file)} />
           <code>{displayPath(props.file)}</code>
         </div>
         <div className="file-heading-meta">
@@ -1464,6 +1674,7 @@ function DiffViewer(props: DiffViewerProps) {
           file={props.file}
           comments={props.comments}
           activeTarget={props.activeTarget}
+          onJumpSymbol={props.onJumpSymbol}
           editingId={props.editingId}
           editComment={props.editComment}
           editSeverity={props.editSeverity}

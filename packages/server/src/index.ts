@@ -241,6 +241,17 @@ async function handleApiRequest(
     return;
   }
 
+  // Generate a commit message from the staged diff via the configured agent.
+  if (method === 'POST' && pathName === '/api/git/commit-message') {
+    try {
+      const message = await generateCommitMessage(repoRoot);
+      sendJson(res, 200, { message });
+    } catch (e: unknown) {
+      sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) });
+    }
+    return;
+  }
+
   if (method === 'POST' && pathName === '/api/prompt/build') {
     const config = await loadConfig(repoRoot);
     const { message } = await readJson<{ message?: string }>(req);
@@ -352,7 +363,49 @@ async function handleApiRequest(
     return;
   }
 
+  // Lightweight "go to definition": grep tracked files for a symbol's definition.
+  if (method === 'GET' && pathName === '/api/repo/definition') {
+    const name = (url.searchParams.get('name') ?? '').trim();
+    if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) { sendJson(res, 400, { error: 'Invalid symbol' }); return; }
+    sendJson(res, 200, { name, matches: await findDefinitions(repoRoot, name) });
+    return;
+  }
+
   sendJson(res, 404, { error: 'Not found.' });
+}
+
+interface DefinitionMatch { path: string; line: number; text: string }
+
+/** Grep tracked files for likely definition sites of `name`, strongest patterns first. */
+async function findDefinitions(repoRoot: string, name: string): Promise<DefinitionMatch[]> {
+  const B = '[^A-Za-z0-9_$]'; // word boundary char class for ERE
+  const kw = '(function|class|interface|type|enum|struct|trait|def|func|fn|impl|module|namespace)';
+  // Strong: a definition keyword immediately before the name, or name assigned a function/value.
+  const strong = [
+    `(^|${B})${kw}[ \\t*&]+${name}(${B}|$)`,
+    `(^|${B})(const|let|var)[ \\t]+${name}[ \\t]*[=:]`,
+    `(^|${B})${name}[ \\t]*[:=][ \\t]*(function|async|\\()`,
+  ].join('|');
+  // Weak fallback: name followed by a parameter list and a block/arrow (method/function form).
+  const weak = `(^|${B})${name}[ \\t]*\\([^)]*\\)[ \\t]*(\\{|=>|:)`;
+
+  const run = async (pattern: string): Promise<DefinitionMatch[]> => {
+    try {
+      const { stdout } = await execFileAsync(
+        'git', ['grep', '-nE', '-I', '--', pattern],
+        { cwd: repoRoot, maxBuffer: 8 * 1024 * 1024 }
+      );
+      return stdout.split('\n').filter(Boolean).map((l) => {
+        const m = l.match(/^(.+?):(\d+):(.*)$/);
+        return m ? { path: m[1], line: Number(m[2]), text: m[3].trim() } : null;
+      }).filter((x): x is DefinitionMatch => x !== null);
+    } catch {
+      return []; // git grep exits 1 when there are no matches
+    }
+  };
+
+  const hits = await run(strong);
+  return hits.length ? hits : run(weak);
 }
 
 async function listKnownRepos(currentRoot: string): Promise<{ path: string; name: string; current: boolean }[]> {
@@ -422,6 +475,38 @@ async function loadCodexModels(): Promise<{ id: string; label: string }[]> {
   }
 }
 
+/** Ask the configured agent for a one-line commit message describing the staged diff. */
+async function generateCommitMessage(repoRoot: string): Promise<string> {
+  const { stdout: staged } = await execFileAsync('git', ['diff', '--cached'], {
+    cwd: repoRoot,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (!staged.trim()) throw new Error('No staged changes to summarize. Stage files first.');
+
+  const config = await loadConfig(repoRoot);
+  // Use plain (non-streaming) output for a quick one-shot answer.
+  const command = config.claudeCommand.replace(/--output-format\s+stream-json/, '').trim();
+  const prompt = [
+    'Write a single Conventional Commits message for the following staged git diff.',
+    'Rules: one line, lowercase type prefix (feat/fix/refactor/docs/chore/etc.),',
+    'subject under 72 characters, imperative mood. Output ONLY the message — no quotes,',
+    'no code fences, no explanation.',
+    '',
+    staged.slice(0, 12000),
+  ].join('\n');
+
+  const result = await runAgentCommand(command, prompt, repoRoot);
+  if (!result.success && !result.stdout.trim()) {
+    throw new Error(result.error || 'Agent did not return a commit message.');
+  }
+  // Take the first meaningful line and strip stray quotes/fences/backticks.
+  const line = result.stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .find((l) => l && !l.startsWith('```')) ?? '';
+  return line.replace(/^["'`]+|["'`]+$/g, '').trim();
+}
+
 async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: string, model?: string, sessionId?: string, onChunk?: (text: string) => void, signal?: AbortSignal) {
   const config = await loadConfig(repoRoot);
   const [diff, comments] = await Promise.all([
@@ -434,19 +519,61 @@ async function runAgent(repoRoot: string, kind: AgentKind, customMessage?: strin
 
   if (kind === 'claude') {
     if (sessionId?.startsWith('claude:')) {
-      // Resume: don't add --model or --system-prompt, they conflict with resume
       command = `${command} --resume ${sessionId.slice(7)}`;
     } else {
       if (model) command = `${command} --model ${model}`;
       command = `${command} --system-prompt ${JSON.stringify(systemPrompt)}`;
     }
     console.error('[PatchRelay] claude command:', command);
-    return runAgentCommand(command, userMessage, repoRoot, onChunk, signal);
+    const chunkHandler = command.includes('--output-format stream-json')
+      ? makeStreamJsonChunkHandler(onChunk)
+      : onChunk;
+    return runAgentCommand(command, userMessage, repoRoot, chunkHandler, signal);
   } else {
     if (model) command = `${command} --model ${model}`;
     const fullPrompt = [systemPrompt, '', userMessage].filter(Boolean).join('\n');
     return runAgentCommand(command, fullPrompt, repoRoot, onChunk, signal);
   }
+}
+
+/**
+ * Wraps onChunk to parse JSONL events from `claude --output-format stream-json`.
+ * Extracts text and tool-use names in real time rather than passing raw JSON.
+ */
+function makeStreamJsonChunkHandler(onChunk?: (text: string) => void): (raw: string) => void {
+  let lineBuf = '';
+  return (raw: string) => {
+    lineBuf += raw;
+    const lines = lineBuf.split('\n');
+    lineBuf = lines.pop() ?? '';
+    for (const line of lines) {
+      const text = extractStreamJsonText(line.trim());
+      if (text) onChunk?.(text);
+    }
+  };
+}
+
+function extractStreamJsonText(line: string): string | null {
+  if (!line) return null;
+  try {
+    const obj = JSON.parse(line) as Record<string, unknown>;
+    if (obj.type !== 'assistant') return null;
+    const msg = obj.message as { content?: unknown[] } | undefined;
+    if (!Array.isArray(msg?.content)) return null;
+    const parts: string[] = [];
+    for (const block of msg.content) {
+      if (typeof block !== 'object' || !block) continue;
+      const b = block as Record<string, unknown>;
+      if (b.type === 'text' && typeof b.text === 'string') {
+        parts.push(b.text);
+      } else if (b.type === 'tool_use' && typeof b.name === 'string') {
+        const cmd = (b.input as Record<string, unknown> | undefined)?.command;
+        const detail = typeof cmd === 'string' ? ` \`${cmd.split('\n')[0].slice(0, 80)}\`` : '';
+        parts.push(`\n> [${b.name}]${detail}\n`);
+      }
+    }
+    return parts.length ? parts.join('') : null;
+  } catch { return null; }
 }
 
 async function serveStatic(
