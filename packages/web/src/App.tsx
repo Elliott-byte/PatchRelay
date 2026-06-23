@@ -336,6 +336,16 @@ export function App() {
     } catch (e) { setError(msgFor(e)); }
   }
 
+  // Merge a branch into the current branch (UI for `git merge <branch>`).
+  async function mergeBranchInto(branch: string) {
+    const target = branches?.current ?? diff?.repo.branch ?? 'current branch';
+    try {
+      const r = await api<{ message: string }>('/api/git/merge', { method: 'POST', body: JSON.stringify({ branch }) });
+      flash(`Merged ${branch} → ${target}: ${(r.message || '').split('\n')[0].slice(0, 80)}`);
+      await Promise.all([refresh(false), loadBranches(), loadSyncStatus(), loadCommitLog()]);
+    } catch (e) { setError(msgFor(e)); }
+  }
+
   async function stageFile(file: DiffFile) {
     try {
       await api('/api/git/stage', { method: 'POST', body: JSON.stringify({ files: [displayPath(file)] }) });
@@ -625,6 +635,7 @@ export function App() {
             onCreate={(name) => void createNewBranch(name)}
             onDelete={(name) => void deleteExistingBranch(name)}
             onCompare={(b) => void compareWithBranch(b)}
+            onMerge={(b) => void mergeBranchInto(b)}
           />
         </div>
 
@@ -1002,9 +1013,10 @@ interface BranchSelectorProps {
   onCreate: (name: string) => void;
   onDelete: (name: string) => void;
   onCompare: (branch: string) => void;
+  onMerge: (branch: string) => void;
 }
 
-function BranchSelector({ current, branches, switching, onSwitch, onCreate, onDelete, onCompare }: BranchSelectorProps) {
+function BranchSelector({ current, branches, switching, onSwitch, onCreate, onDelete, onCompare, onMerge }: BranchSelectorProps) {
   const [open, setOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
@@ -1075,6 +1087,13 @@ function BranchSelector({ current, branches, switching, onSwitch, onCreate, onDe
                       onClick={(e) => { e.stopPropagation(); onCompare(b); setOpen(false); }}
                     >
                       ⇄
+                    </button>
+                    <button
+                      className="branch-merge-btn"
+                      title={`Merge ${b} into ${current}`}
+                      onClick={(e) => { e.stopPropagation(); onMerge(b); setOpen(false); }}
+                    >
+                      ⤵
                     </button>
                     <button
                       className="branch-delete-btn"

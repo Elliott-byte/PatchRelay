@@ -29,6 +29,7 @@ import {
   listBranches,
   listComments,
   loadConfig,
+  mergeBranch,
   pullChanges,
   pushChanges,
   runAgentCommand,
@@ -225,6 +226,20 @@ async function handleApiRequest(
   if (branchMatch && method === 'DELETE') {
     await deleteBranch(repoRoot, decodeURIComponent(branchMatch[1]));
     sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  if (method === 'POST' && pathName === '/api/git/merge') {
+    const { branch } = await readJson<{ branch?: string }>(req);
+    if (!branch || branch.startsWith('-') || !/^[\w./@-]+$/.test(branch)) { sendJson(res, 400, { error: 'Invalid branch' }); return; }
+    try {
+      sendJson(res, 200, await mergeBranch(repoRoot, branch));
+    } catch (e: unknown) {
+      // git merge writes conflict info to stdout and fails non-zero; surface it.
+      const err = e as { stdout?: string; stderr?: string; message?: string };
+      const raw = (err.stdout || err.stderr || err.message || 'Merge failed.').toString();
+      sendJson(res, 409, { error: raw.split('\n').filter(Boolean).slice(0, 4).join(' ').slice(0, 240) });
+    }
     return;
   }
 

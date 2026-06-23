@@ -320,6 +320,27 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 .branch-item:hover .branch-compare-btn { opacity: 1; }
 .branch-compare-btn:hover { background: var(--accent-dim); color: var(--accent); }
 
+.branch-merge-btn {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-xs);
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  flex-shrink: 0;
+  font-size: 14px;
+  height: 26px;
+  justify-content: center;
+  line-height: 1;
+  opacity: 0;
+  padding: 0;
+  transition: opacity 0.1s, color 0.1s, background 0.1s;
+  width: 26px;
+}
+.branch-item:hover .branch-merge-btn { opacity: 1; }
+.branch-merge-btn:hover { background: var(--green-dim); color: var(--green); }
+
 .branch-new {
   border-top: 1px solid var(--glass-border);
   padding: 6px;

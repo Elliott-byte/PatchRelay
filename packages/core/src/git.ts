@@ -363,6 +363,13 @@ export async function deleteBranch(repoRoot: string, name: string): Promise<void
   await execFileAsync('git', ['branch', '-D', name], { cwd: repoRoot });
 }
 
+/** Merge `branch` into the current branch (auto-commit). Throws on conflict/error
+ *  with git's output attached so the caller can surface it. */
+export async function mergeBranch(repoRoot: string, branch: string): Promise<{ message: string }> {
+  const { stdout, stderr } = await execFileAsync('git', ['merge', '--no-edit', branch], { cwd: repoRoot });
+  return { message: (stdout || stderr || 'Merged.').trim() };
+}
+
 export async function stageFiles(repoRoot: string, files: string[]): Promise<void> {
   const args = files.length > 0 ? ['add', '--', ...files] : ['add', '-A'];
   await execFileAsync('git', args, { cwd: repoRoot });
