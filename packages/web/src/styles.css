@@ -990,6 +990,11 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 .commit-input::placeholder { color: var(--text-muted); }
 .commit-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); outline: none; }
 
+.amend-check {
+  align-items: center; color: var(--text-2); cursor: pointer; display: flex;
+  font-size: 11px; gap: 6px; user-select: none;
+}
+.amend-check input { accent-color: var(--accent); cursor: pointer; margin: 0; }
 .commit-actions { display: flex; gap: 8px; }
 .commit-gen-btn {
   background: var(--accent-dim); border: 1px solid rgba(10,132,255,0.3);

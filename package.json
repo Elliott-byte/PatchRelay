@@ -14,6 +14,9 @@
     "build": "npm run build -w @patchrelay/core && npm run build -w @patchrelay/server && npm run build -w @patchrelay/web && npm run build -w @patchrelay/cli",
     "typecheck": "npm run build -w @patchrelay/core && npm run build -w @patchrelay/server && npm run typecheck -w @patchrelay/web && npm run typecheck -w @patchrelay/cli",
     "patchrelay": "npm run start -w @patchrelay/cli --",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "ci": "npm run typecheck && npm run test",
     "dev": "concurrently -n api,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
     "dev:server": "tsx watch --tsconfig tsconfig.dev.json scripts/dev-server.ts",
     "dev:web": "npm run dev -w @patchrelay/web"
@@ -22,6 +25,7 @@
     "@types/node": "^20.14.10",
     "concurrently": "^9.2.3",
     "tsx": "^4.22.4",
-    "typescript": "^5.5.3"
+    "typescript": "^5.5.3",
+    "vitest": "^2.1.9"
   }
 }

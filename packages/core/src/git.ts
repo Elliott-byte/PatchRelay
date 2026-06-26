@@ -566,7 +566,7 @@ export async function getBlame(repoRoot: string, file: string): Promise<BlameLin
   return parseBlamePorcelain(stdout);
 }
 
-function parseBlamePorcelain(out: string): BlameLine[] {
+export function parseBlamePorcelain(out: string): BlameLine[] {
   const result: BlameLine[] = [];
   const meta = new Map<string, { author?: string; time?: number; summary?: string }>();
   let cur: { hash: string; finalLine: number } | null = null;
@@ -612,12 +612,15 @@ export async function discardFile(repoRoot: string, file: string): Promise<void>
 
 export interface StashEntry { index: number; ref: string; message: string; }
 
-export async function stashList(repoRoot: string): Promise<StashEntry[]> {
-  const out = await gitTry(repoRoot, ['stash', 'list']);
+export function parseStashList(out: string): StashEntry[] {
   return out.split('\n').filter(Boolean).map((l) => {
     const m = l.match(/^stash@\{(\d+)\}:\s*(.*)$/);
     return m ? { index: Number(m[1]), ref: `stash@{${m[1]}}`, message: m[2] } : null;
   }).filter((x): x is StashEntry => x !== null);
+}
+
+export async function stashList(repoRoot: string): Promise<StashEntry[]> {
+  return parseStashList(await gitTry(repoRoot, ['stash', 'list']));
 }
 
 export async function stashSave(repoRoot: string, message?: string): Promise<{ message: string }> {
@@ -657,6 +660,19 @@ export async function resetToCommit(repoRoot: string, hash: string, mode: 'soft'
 
 export async function createBranchAt(repoRoot: string, name: string, hash: string): Promise<void> {
   await execFileAsync('git', ['checkout', '-b', name, hash], { cwd: repoRoot });
+}
+
+export async function amendCommit(repoRoot: string, message?: string): Promise<{ hash: string }> {
+  const args = message && message.trim() ? ['commit', '--amend', '-m', message.trim()] : ['commit', '--amend', '--no-edit'];
+  await execFileAsync('git', args, { cwd: repoRoot });
+  const { stdout } = await execFileAsync('git', ['rev-parse', '--short', 'HEAD'], { cwd: repoRoot });
+  return { hash: stdout.trim() };
+}
+
+export async function createTag(repoRoot: string, name: string, hash?: string): Promise<void> {
+  const args = ['tag', name];
+  if (hash) args.push(hash);
+  await execFileAsync('git', args, { cwd: repoRoot });
 }
 
 function stripDiffPath(rawPath: string): string {

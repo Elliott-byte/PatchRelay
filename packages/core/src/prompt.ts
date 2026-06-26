@@ -1,8 +1,30 @@
-import type { DiffFile, DiffHunk, DiffLine, DiffResponse, ReviewComment } from './types.js';
+import type { CommentSeverity, DiffFile, DiffHunk, DiffLine, DiffResponse, ReviewComment } from './types.js';
 
 export interface AgentInput {
   systemPrompt: string;
   userMessage: string;
+}
+
+export interface ReviewFinding { file: string; line: number; severity: CommentSeverity; comment: string; }
+
+export function normalizeReviewSeverity(s: unknown): CommentSeverity {
+  const v = String(s ?? '').toLowerCase();
+  return v === 'bug' || v === 'question' || v === 'nit' || v === 'note' ? v : 'note';
+}
+
+/** Extract review findings from the model's output (the first top-level JSON array). */
+export function parseReviewFindings(text: string): ReviewFinding[] {
+  const start = text.indexOf('[');
+  const end = text.lastIndexOf(']');
+  if (start === -1 || end === -1 || end < start) return [];
+  let arr: unknown;
+  try { arr = JSON.parse(text.slice(start, end + 1)); } catch { return []; }
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
+    .filter((x) => typeof x.file === 'string' && typeof x.comment === 'string')
+    .map((x) => ({ file: String(x.file), line: Number(x.line), severity: normalizeReviewSeverity(x.severity), comment: String(x.comment).trim() }))
+    .filter((f) => f.comment.length > 0);
 }
 
 // ── AI code review (generate review comments from a diff) ──────────────────────

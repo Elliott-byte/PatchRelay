@@ -8,11 +8,13 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 import {
+  amendCommit,
   buildAgentInput,
   buildReviewRequestPrompt,
   checkoutBranch,
   cherryPickCommit,
   createBranchAt,
+  createTag,
   discardFile,
   findGitRoot,
   createBranch,
@@ -41,6 +43,7 @@ import {
   listComments,
   loadConfig,
   mergeBranch,
+  parseReviewFindings,
   pullChanges,
   pushChanges,
   runAgentCommand,
@@ -49,7 +52,6 @@ import {
   unstageFiles,
   updateComment,
   type AgentKind,
-  type CommentSeverity,
   type CreateCommentInput,
   type DiffResponse,
   type PatchRelayConfig,
@@ -302,6 +304,20 @@ async function handleApiRequest(
     if (!name || name.startsWith('-') || !/^[\w./-]+$/.test(name)) { sendJson(res, 400, { error: 'Invalid branch name' }); return; }
     if (!hash || !/^[0-9a-fA-F]{4,40}$/.test(hash)) { sendJson(res, 400, { error: 'Invalid commit hash' }); return; }
     try { await createBranchAt(repoRoot, name, hash); sendJson(res, 200, { ok: true }); }
+    catch (e) { sendJson(res, 409, { error: e instanceof Error ? e.message : String(e) }); }
+    return;
+  }
+  if (method === 'POST' && pathName === '/api/git/amend') {
+    const { message } = await readJson<{ message?: string }>(req);
+    try { sendJson(res, 200, await amendCommit(repoRoot, message)); }
+    catch (e) { sendJson(res, 409, { error: e instanceof Error ? e.message : String(e) }); }
+    return;
+  }
+  if (method === 'POST' && pathName === '/api/git/tag') {
+    const { name, hash } = await readJson<{ name?: string; hash?: string }>(req);
+    if (!name || name.startsWith('-') || !/^[\w./-]+$/.test(name)) { sendJson(res, 400, { error: 'Invalid tag name' }); return; }
+    if (hash && !/^[0-9a-fA-F]{4,40}$/.test(hash)) { sendJson(res, 400, { error: 'Invalid commit hash' }); return; }
+    try { await createTag(repoRoot, name, hash); sendJson(res, 200, { ok: true }); }
     catch (e) { sendJson(res, 409, { error: e instanceof Error ? e.message : String(e) }); }
     return;
   }
@@ -622,27 +638,7 @@ function oneShotClaudeCommand(claudeCommand: string): string {
     .trim();
 }
 
-interface ReviewFinding { file: string; line: number; severity: CommentSeverity; comment: string; }
-
-function normalizeReviewSeverity(s: unknown): CommentSeverity {
-  const v = String(s ?? '').toLowerCase();
-  return v === 'bug' || v === 'question' || v === 'nit' || v === 'note' ? v : 'note';
-}
-
-function parseReviewFindings(text: string): ReviewFinding[] {
-  const start = text.indexOf('[');
-  const end = text.lastIndexOf(']');
-  if (start === -1 || end === -1 || end < start) return [];
-  let arr: unknown;
-  try { arr = JSON.parse(text.slice(start, end + 1)); } catch { return []; }
-  if (!Array.isArray(arr)) return [];
-  return arr
-    .filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
-    .filter((x) => typeof x.file === 'string' && typeof x.comment === 'string')
-    .map((x) => ({ file: String(x.file), line: Number(x.line), severity: normalizeReviewSeverity(x.severity), comment: String(x.comment).trim() }))
-    .filter((f) => f.comment.length > 0);
-}
-
+type ReviewFinding = import('@patchrelay/core').ReviewFinding;
 type CommentAnchor = Omit<CreateCommentInput, 'comment' | 'severity' | 'author'>;
 
 /** Resolve a finding to a concrete review-comment anchor in the diff. */

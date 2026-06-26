@@ -83,6 +83,7 @@ export function App() {
   const [commitMessage, setCommitMessage] = useState('');
   const [generatingMsg, setGeneratingMsg] = useState(false);
   const [reviewing, setReviewing] = useState(false);
+  const [amendMode, setAmendMode] = useState(false);
   const [diffView, setDiffView] = useState<DiffViewMode>(() => (localStorage.getItem('pr-diffview') === 'split' ? 'split' : 'unified'));
   const setDiffViewPersisted = (v: DiffViewMode) => { setDiffView(v); localStorage.setItem('pr-diffview', v); };
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
@@ -269,6 +270,13 @@ export function App() {
   async function handleCommitAction(action: string, c: CommitLogEntry) {
     try {
       if (action === 'copy') { await navigator.clipboard.writeText(c.hash); flash(`Copied ${c.shortHash}`); return; }
+      if (action === 'tag') {
+        const name = window.prompt(`Tag name for ${c.shortHash}:`, '');
+        if (!name?.trim()) return;
+        await api('/api/git/tag', { method: 'POST', body: JSON.stringify({ name: name.trim(), hash: c.hash }) });
+        flash(`Tagged ${c.shortHash} as ${name.trim()}`);
+        return;
+      }
       if (action === 'branch') {
         const name = window.prompt(`New branch from ${c.shortHash}:`, '');
         if (!name?.trim()) return;
@@ -435,6 +443,18 @@ export function App() {
   }
 
   async function commit() {
+    if (amendMode) {
+      // Amend: message optional (keeps existing if blank); staged changes optional.
+      setBusy(true);
+      try {
+        const r = await api<{ hash: string }>('/api/git/amend', { method: 'POST', body: JSON.stringify({ message: commitMessage.trim() || undefined }) });
+        setCommitMessage(''); setAmendMode(false);
+        flash(`Amended → ${r.hash}`);
+        await Promise.all([refresh(false), loadSyncStatus(), loadCommitLog()]);
+      } catch (e) { setError(msgFor(e)); }
+      finally { setBusy(false); }
+      return;
+    }
     if (!commitMessage.trim() || !hasStagedChanges) return;
     setBusy(true);
     try {
@@ -443,7 +463,7 @@ export function App() {
       });
       setCommitMessage('');
       flash(`Committed ${r.hash}`);
-      await refresh(false);
+      await Promise.all([refresh(false), loadSyncStatus(), loadCommitLog()]);
     } catch (e) { setError(msgFor(e)); }
     finally { setBusy(false); }
   }
@@ -830,16 +850,20 @@ export function App() {
                 ) : <p className="empty-hint">No local diff.</p>}
               </div>
               <div className="commit-panel">
-                <textarea className="commit-input" value={commitMessage} onChange={(e) => setCommitMessage(e.target.value)} placeholder="Commit message…" rows={3} />
+                <textarea className="commit-input" value={commitMessage} onChange={(e) => setCommitMessage(e.target.value)} placeholder={amendMode ? 'Amend message (blank = keep)…' : 'Commit message…'} rows={3} />
+                <label className="amend-check" title="Replace the last commit instead of creating a new one">
+                  <input type="checkbox" checked={amendMode} onChange={(e) => setAmendMode(e.target.checked)} />
+                  Amend last commit
+                </label>
                 <div className="commit-actions">
                   <button className="commit-gen-btn" onClick={() => void generateMessage()} disabled={generatingMsg || busy || !hasStagedChanges} title="Generate a commit message from staged changes">
                     {generatingMsg ? 'Generating…' : '✨ Generate'}
                   </button>
-                  <button className="commit-btn" onClick={() => void commit()} disabled={busy || generatingMsg || !commitMessage.trim() || !hasStagedChanges}>
-                    Commit
+                  <button className="commit-btn" onClick={() => void commit()} disabled={busy || generatingMsg || (amendMode ? false : (!commitMessage.trim() || !hasStagedChanges))}>
+                    {amendMode ? 'Amend' : 'Commit'}
                   </button>
                 </div>
-                {!hasStagedChanges && !!diff?.files.length && <p className="commit-hint">Stage files to commit.</p>}
+                {!amendMode && !hasStagedChanges && !!diff?.files.length && <p className="commit-hint">Stage files to commit.</p>}
 
                 {/* Remote sync — push / pull / fetch + ahead-behind */}
                 <div className="sync-bar">
@@ -1830,6 +1854,7 @@ function CommitRow({ commit, active, onOpen, onAction }: {
         <div className="commit-menu">
           <button onClick={() => act('copy')}>Copy hash</button>
           <button onClick={() => act('branch')}>New branch here…</button>
+          <button onClick={() => act('tag')}>Create tag here…</button>
           <button onClick={() => act('cherry')}>Cherry-pick</button>
           <button onClick={() => act('revert')}>Revert commit</button>
           <div className="commit-menu-sep" />
