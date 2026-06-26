@@ -986,22 +986,22 @@ export function App() {
           ) : (
           <div className="center-content">
             {activeTab === 'files' && (
-              <>
-                <div className="files-toolbar">
-                  <strong>{totalStats.files} files</strong>
-                  <span><span className="adds">+{totalStats.additions}</span> <span className="dels">−{totalStats.deletions}</span></span>
-                  {diff?.updatedAt ? <span className="muted">{formatDate(diff.updatedAt)}</span> : null}
-                  <div className="files-toolbar-actions">
-                    <button
-                      className="ai-review-btn"
-                      onClick={() => void runAiReview()}
-                      disabled={reviewing || !diff?.files.length}
-                      title="Let the AI review these changes and add review comments"
-                    >{reviewing ? '✨ Reviewing…' : '✨ AI Review'}</button>
-                    <DiffViewToggle value={diffView} onChange={setDiffViewPersisted} />
+              selectedFile ? (
+                <>
+                  <div className="files-toolbar">
+                    <strong>{totalStats.files} {totalStats.files === 1 ? 'file' : 'files'}</strong>
+                    <span><span className="adds">+{totalStats.additions}</span> <span className="dels">−{totalStats.deletions}</span></span>
+                    {diff?.updatedAt ? <span className="muted">{formatDate(diff.updatedAt)}</span> : null}
+                    <div className="files-toolbar-actions">
+                      <button
+                        className="ai-review-btn"
+                        onClick={() => void runAiReview()}
+                        disabled={reviewing}
+                        title="Let the AI review these changes and add review comments"
+                      >{reviewing ? '✨ Reviewing…' : '✨ AI Review'}</button>
+                      <DiffViewToggle value={diffView} onChange={setDiffViewPersisted} />
+                    </div>
                   </div>
-                </div>
-                {selectedFile ? (
                   <DiffViewer file={selectedFile} comments={comments} activeTarget={activeTarget}
                     draftComment={draftComment} draftSeverity={draftSeverity} editingId={editingId}
                     editComment={editComment} editSeverity={editSeverity}
@@ -1017,8 +1017,11 @@ export function App() {
                     onResolve={(c) => void setCommentStatus(c, 'resolved')}
                     onReopen={(c) => void setCommentStatus(c, 'open')}
                     onDelete={(c) => void removeComment(c)} />
-                ) : <div className="empty-state">Make a local change and refresh.</div>}
-              </>
+                </>
+              ) : (
+                <EmptyState icon="✓" title="No local changes"
+                  hint="Edit files in your repo and they'll show up here to review, comment on, and commit. Use the Explorer or History tabs to browse the repo." />
+              )
             )}
             {activeTab === 'comments' && (
               <CommentsTab comments={comments} editingId={editingId} editComment={editComment} editSeverity={editSeverity}
@@ -1042,7 +1045,8 @@ export function App() {
                   </div>
                 </div>
                 {promptPreview ? <pre className="prompt-preview-content">{promptPreview}</pre>
-                  : <div className="empty-state">{busy ? 'Building…' : 'Click Rebuild to preview the prompt.'}</div>}
+                  : <EmptyState icon="📝" title={busy ? 'Building…' : 'Prompt preview'}
+                      hint={busy ? undefined : 'Click Rebuild to see the exact prompt (diff + open comments) that gets sent to the agent.'} />}
               </div>
             )}
           </div>
@@ -1759,7 +1763,8 @@ function CommentsTab(props: CommentsTabProps) {
   const open = props.comments.filter((c) => c.status === 'open');
   const resolved = props.comments.filter((c) => c.status === 'resolved');
   if (!props.comments.length) {
-    return <div className="empty-state">No review comments yet. Click + on a diff line.</div>;
+    return <EmptyState icon="💬" title="No review comments"
+      hint={<>Hover a diff line and click <b>+</b> to comment, or run <b>✨ AI Review</b> to generate them automatically.</>} />;
   }
   return (
     <div className="comments-tab">
@@ -2226,6 +2231,16 @@ function HighlightedHunk(props: HighlightedHunkProps) {
 }
 
 // ── Diff viewer ───────────────────────────────────────────────────────────────
+
+function EmptyState({ icon, title, hint }: { icon: string; title: string; hint?: React.ReactNode }) {
+  return (
+    <div className="empty-state">
+      <div className="empty-state-icon" aria-hidden>{icon}</div>
+      <div className="empty-state-title">{title}</div>
+      {hint && <div className="empty-state-hint">{hint}</div>}
+    </div>
+  );
+}
 
 /** Unified ⇄ Split segmented toggle (GitHub/Bitbucket-style). */
 function DiffViewToggle({ value, onChange }: { value: DiffViewMode; onChange: (v: DiffViewMode) => void }) {
