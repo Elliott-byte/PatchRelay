@@ -36,6 +36,13 @@ describe('parseBlamePorcelain', () => {
   it('returns [] for empty input', () => {
     expect(parseBlamePorcelain('')).toEqual([]);
   });
+
+  it('tolerates CRLF line endings (Windows)', () => {
+    const crlf = BLAME.replace(/\n/g, '\r\n');
+    const lines = parseBlamePorcelain(crlf);
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatchObject({ line: 1, author: 'Alice' });
+  });
 });
 
 describe('parseStashList', () => {
@@ -49,5 +56,13 @@ describe('parseStashList', () => {
 
   it('returns [] for empty input', () => {
     expect(parseStashList('')).toEqual([]);
+  });
+
+  it('tolerates CRLF line endings (Windows)', () => {
+    const out = 'stash@{0}: WIP on main: fix\r\nstash@{1}: note\r\n';
+    expect(parseStashList(out)).toEqual([
+      { index: 0, ref: 'stash@{0}', message: 'WIP on main: fix' },
+      { index: 1, ref: 'stash@{1}', message: 'note' },
+    ]);
   });
 });

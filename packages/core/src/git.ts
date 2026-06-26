@@ -570,7 +570,7 @@ export function parseBlamePorcelain(out: string): BlameLine[] {
   const result: BlameLine[] = [];
   const meta = new Map<string, { author?: string; time?: number; summary?: string }>();
   let cur: { hash: string; finalLine: number } | null = null;
-  for (const l of out.split('\n')) {
+  for (const l of out.split(/\r?\n/)) {
     const head = l.match(/^([0-9a-f]{7,40})\s+\d+\s+(\d+)(?:\s+\d+)?$/);
     if (head) {
       cur = { hash: head[1], finalLine: Number(head[2]) };
@@ -613,9 +613,9 @@ export async function discardFile(repoRoot: string, file: string): Promise<void>
 export interface StashEntry { index: number; ref: string; message: string; }
 
 export function parseStashList(out: string): StashEntry[] {
-  return out.split('\n').filter(Boolean).map((l) => {
+  return out.split(/\r?\n/).filter(Boolean).map((l) => {
     const m = l.match(/^stash@\{(\d+)\}:\s*(.*)$/);
-    return m ? { index: Number(m[1]), ref: `stash@{${m[1]}}`, message: m[2] } : null;
+    return m ? { index: Number(m[1]), ref: `stash@{${m[1]}}`, message: m[2].replace(/\r$/, '') } : null;
   }).filter((x): x is StashEntry => x !== null);
 }
 
