@@ -62,6 +62,7 @@ export interface ReviewComment {
   comment: string;
   severity: CommentSeverity;
   status: CommentStatus;
+  author?: 'human' | 'ai';
   createdAt: string;
   updatedAt: string;
 }
@@ -74,6 +75,7 @@ export interface CreateCommentInput {
   selectedCode?: string;
   comment: string;
   severity?: CommentSeverity;
+  author?: 'human' | 'ai';
 }
 
 export interface UpdateCommentInput {

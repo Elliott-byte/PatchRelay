@@ -26,6 +26,7 @@ export async function createComment(repoRoot: string, input: CreateCommentInput)
     comment: input.comment,
     severity: input.severity ?? 'bug',
     status: 'open',
+    author: input.author ?? 'human',
     createdAt: now,
     updatedAt: now
   };

@@ -5,6 +5,55 @@ export interface AgentInput {
   userMessage: string;
 }
 
+// ── AI code review (generate review comments from a diff) ──────────────────────
+
+const MAX_REVIEW_CHARS = 36000;
+
+/** Prompt asking the model to review a diff and return structured JSON findings. */
+export function buildReviewRequestPrompt(diff: DiffResponse): string {
+  let body = '';
+  let truncated = false;
+  for (const file of diff.files) {
+    const section = formatFileForReview(file);
+    if (body && body.length + section.length > MAX_REVIEW_CHARS) { truncated = true; break; }
+    // Always include at least the first file, truncating it if it alone is huge.
+    body += (body ? '\n\n' : '') + (section.length > MAX_REVIEW_CHARS ? section.slice(0, MAX_REVIEW_CHARS) + '\n… (file truncated)' : section);
+    if (body.length > MAX_REVIEW_CHARS) { truncated = true; break; }
+  }
+
+  return [
+    'You are a meticulous senior engineer reviewing the following local code changes.',
+    'Find real, actionable problems: correctness bugs, security issues, resource leaks,',
+    'race conditions, missing error handling, edge cases, and clear regressions. Also flag',
+    'risky patterns. Do NOT praise, summarize, or restate the code, and skip purely stylistic',
+    'nits unless they cause real confusion.',
+    '',
+    'Anchor every finding to a specific line shown below, using its NEW-file line number',
+    '(the number in the left margin). Prefer added (+) lines.',
+    '',
+    'Respond with ONLY a JSON array — no prose, no markdown fences. Each element:',
+    '{"file":"<path>","line":<new-file line number>,"severity":"bug"|"question"|"nit"|"note","comment":"<one concise sentence>"}',
+    'Order by importance, at most 20 findings. If the changes look fine, return [].',
+    truncated ? '\n(Note: the diff was truncated; review what is shown.)' : '',
+    '',
+    '=== CHANGES ===',
+    body,
+  ].filter(Boolean).join('\n');
+}
+
+function formatFileForReview(file: DiffFile): string {
+  const path = file.newPath !== '/dev/null' ? file.newPath : file.oldPath;
+  const hunks = file.hunks.map((hunk) => {
+    const lines = hunk.lines.map((line) => {
+      const num = typeof line.newLine === 'number' ? String(line.newLine).padStart(5, ' ') : '     ';
+      const pfx = line.type === 'add' ? '+' : line.type === 'remove' ? '-' : ' ';
+      return `${num} ${pfx}${line.content}`;
+    });
+    return [hunk.header, ...lines].join('\n');
+  }).join('\n');
+  return `File: ${path}\n${hunks}`;
+}
+
 export function buildAgentInput(
   diff: DiffResponse,
   comments: ReviewComment[],

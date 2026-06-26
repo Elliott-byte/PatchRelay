@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 import {
   buildAgentInput,
+  buildReviewRequestPrompt,
   checkoutBranch,
   findGitRoot,
   createBranch,
@@ -38,7 +39,9 @@ import {
   unstageFiles,
   updateComment,
   type AgentKind,
+  type CommentSeverity,
   type CreateCommentInput,
+  type DiffResponse,
   type PatchRelayConfig,
   type UpdateCommentInput
 } from '@patchrelay/core';
@@ -304,6 +307,16 @@ async function handleApiRequest(
     return;
   }
 
+  // AI code review: generate review comments from the working-tree diff.
+  if (method === 'POST' && pathName === '/api/review/generate') {
+    try {
+      sendJson(res, 200, await generateReview(repoRoot));
+    } catch (e: unknown) {
+      sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) });
+    }
+    return;
+  }
+
   // Generate a commit message from the staged diff via the configured agent.
   if (method === 'POST' && pathName === '/api/git/commit-message') {
     try {
@@ -531,6 +544,93 @@ async function loadCodexModels(): Promise<{ id: string; label: string }[]> {
   }
 }
 
+/** Strip streaming flags so a one-shot, non-streaming claude command is used. */
+function oneShotClaudeCommand(claudeCommand: string): string {
+  return claudeCommand
+    .replace(/--output-format\s+stream-json/, '')
+    .replace(/--verbose/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+interface ReviewFinding { file: string; line: number; severity: CommentSeverity; comment: string; }
+
+function normalizeReviewSeverity(s: unknown): CommentSeverity {
+  const v = String(s ?? '').toLowerCase();
+  return v === 'bug' || v === 'question' || v === 'nit' || v === 'note' ? v : 'note';
+}
+
+function parseReviewFindings(text: string): ReviewFinding[] {
+  const start = text.indexOf('[');
+  const end = text.lastIndexOf(']');
+  if (start === -1 || end === -1 || end < start) return [];
+  let arr: unknown;
+  try { arr = JSON.parse(text.slice(start, end + 1)); } catch { return []; }
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .filter((x): x is Record<string, unknown> => !!x && typeof x === 'object')
+    .filter((x) => typeof x.file === 'string' && typeof x.comment === 'string')
+    .map((x) => ({ file: String(x.file), line: Number(x.line), severity: normalizeReviewSeverity(x.severity), comment: String(x.comment).trim() }))
+    .filter((f) => f.comment.length > 0);
+}
+
+type CommentAnchor = Omit<CreateCommentInput, 'comment' | 'severity' | 'author'>;
+
+/** Resolve a finding to a concrete review-comment anchor in the diff. */
+function anchorFinding(diff: DiffResponse, f: ReviewFinding): CommentAnchor | null {
+  const file = diff.files.find((df) => (df.newPath !== '/dev/null' ? df.newPath : df.oldPath) === f.file)
+    ?? diff.files.find((df) => df.newPath === f.file || df.oldPath === f.file);
+  if (!file) return null;
+  const path = file.newPath !== '/dev/null' ? file.newPath : file.oldPath;
+  for (const hunk of file.hunks) {
+    const match = hunk.lines.find((l) => l.newLine === f.line);
+    if (match) return { file: path, side: 'new', line: f.line, hunkHeader: hunk.header, selectedCode: match.content };
+  }
+  // Fallback: anchor to the first numbered line of the file so the finding isn't lost.
+  for (const hunk of file.hunks) {
+    const first = hunk.lines.find((l) => typeof l.newLine === 'number');
+    if (first) return { file: path, side: 'new', line: first.newLine!, hunkHeader: hunk.header, selectedCode: first.content };
+  }
+  return null;
+}
+
+/** Generated/build artifacts that aren't worth an AI review. */
+function isReviewableFile(p: string): boolean {
+  return !(/(^|\/)dist\//.test(p) || /(^|\/)node_modules\//.test(p) || /\.tsbuildinfo$/.test(p)
+    || /(^|\/)(package-lock|pnpm-lock|yarn)\.(json|lock|ya?ml)$/.test(p) || /\.min\.(js|css)$/.test(p));
+}
+
+/** AI code review: send the diff to the model, turn JSON findings into review comments. */
+async function generateReview(repoRoot: string): Promise<{ created: number; total: number }> {
+  const config = await loadConfig(repoRoot);
+  const full = await getDiffResponse(repoRoot, config);
+  const diff: DiffResponse = {
+    ...full,
+    files: full.files.filter((f) => isReviewableFile(f.newPath !== '/dev/null' ? f.newPath : f.oldPath)),
+  };
+  if (!diff.files.length) throw new Error('No reviewable changes. Make some source edits first.');
+
+  const command = oneShotClaudeCommand(config.claudeCommand);
+  const result = await runAgentCommand(command, buildReviewRequestPrompt(diff), repoRoot);
+  if (!result.success && !result.stdout.trim()) {
+    throw new Error(result.error || 'Review agent returned nothing.');
+  }
+  const findings = parseReviewFindings(result.stdout);
+
+  let created = 0;
+  const seen = new Set<string>();
+  for (const f of findings.slice(0, 20)) {
+    const anchor = anchorFinding(diff, f);
+    if (!anchor) continue;
+    const key = `${anchor.file}:${anchor.line}`;
+    if (seen.has(key)) continue; // one comment per anchor line
+    seen.add(key);
+    await createComment(repoRoot, { ...anchor, comment: f.comment, severity: f.severity, author: 'ai' });
+    created += 1;
+  }
+  return { created, total: findings.length };
+}
+
 /** Ask the configured agent for a one-line commit message describing the staged diff. */
 async function generateCommitMessage(repoRoot: string): Promise<string> {
   // Keep input tokens low: a compact --stat summary (all files) plus a short slice
@@ -545,11 +645,7 @@ async function generateCommitMessage(repoRoot: string): Promise<string> {
 
   const config = await loadConfig(repoRoot);
   // Plain (non-streaming) output for a quick one-shot answer, on the default model.
-  const command = config.claudeCommand
-    .replace(/--output-format\s+stream-json/, '')
-    .replace(/--verbose/, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const command = oneShotClaudeCommand(config.claudeCommand);
   const prompt = [
     'Write a single Conventional Commits message for these staged changes.',
     'Rules: one line, lowercase type prefix (feat/fix/refactor/docs/chore), subject',

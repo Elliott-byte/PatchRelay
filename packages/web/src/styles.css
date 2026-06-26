@@ -1016,6 +1016,33 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
   padding: 8px 14px;
 }
 .files-toolbar strong { color: var(--text); font-size: 13px; font-weight: 600; }
+.files-toolbar-actions { align-items: center; display: flex; gap: 8px; margin-left: auto; }
+.files-toolbar-actions .diff-view-toggle { margin-left: 0; }
+
+.ai-review-btn {
+  background: linear-gradient(135deg, var(--accent-dim), rgba(191,90,242,0.18));
+  border: 1px solid rgba(10,132,255,0.3);
+  border-radius: var(--radius-xs);
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 12px;
+  transition: background 0.12s, opacity 0.12s;
+  white-space: nowrap;
+}
+.ai-review-btn:hover:not(:disabled) { background: linear-gradient(135deg, var(--accent-glow), rgba(191,90,242,0.28)); }
+.ai-review-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+
+.ai-badge {
+  background: linear-gradient(135deg, var(--accent), #bf5af2);
+  border-radius: var(--pill);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+}
 .muted { color: var(--text-2); font-size: 12px; }
 
 /* ── Diff card ────────────────────────────────────── */
