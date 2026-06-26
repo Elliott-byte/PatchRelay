@@ -3,3 +3,4 @@ dist/
 packages/*/dist/
 .patchrelay/
 .DS_Store
+*.tsbuildinfo
