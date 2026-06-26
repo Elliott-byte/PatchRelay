@@ -11,6 +11,9 @@ import {
   buildAgentInput,
   buildReviewRequestPrompt,
   checkoutBranch,
+  cherryPickCommit,
+  createBranchAt,
+  discardFile,
   findGitRoot,
   createBranch,
   deleteBranch,
@@ -19,7 +22,14 @@ import {
   createComment,
   deleteComment,
   fetchRemote,
+  getBlame,
   getBranchComparison,
+  resetToCommit,
+  revertCommit,
+  stashApply,
+  stashDrop,
+  stashList,
+  stashSave,
   getCodexSession,
   getCommitDiff,
   getCommitLog,
@@ -243,6 +253,65 @@ async function handleApiRequest(
       const raw = (err.stdout || err.stderr || err.message || 'Merge failed.').toString();
       sendJson(res, 409, { error: raw.split('\n').filter(Boolean).slice(0, 4).join(' ').slice(0, 240) });
     }
+    return;
+  }
+
+  if (method === 'POST' && pathName === '/api/git/discard') {
+    const { file } = await readJson<{ file?: string }>(req);
+    if (!file) { sendJson(res, 400, { error: 'Missing file' }); return; }
+    try { await discardFile(repoRoot, file); sendJson(res, 200, { ok: true }); }
+    catch (e) { sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
+    return;
+  }
+
+  if (method === 'GET' && pathName === '/api/git/stash') {
+    sendJson(res, 200, { stashes: await stashList(repoRoot) });
+    return;
+  }
+  if (method === 'POST' && pathName === '/api/git/stash') {
+    const { message } = await readJson<{ message?: string }>(req);
+    await sendGitOp(res, stashSave(repoRoot, message));
+    return;
+  }
+  if (method === 'POST' && pathName === '/api/git/stash/apply') {
+    const { index, pop } = await readJson<{ index?: number; pop?: boolean }>(req);
+    await sendGitOp(res, stashApply(repoRoot, Number(index) || 0, !!pop));
+    return;
+  }
+  if (method === 'POST' && pathName === '/api/git/stash/drop') {
+    const { index } = await readJson<{ index?: number }>(req);
+    await sendGitOp(res, stashDrop(repoRoot, Number(index) || 0));
+    return;
+  }
+
+  if (method === 'POST' && (pathName === '/api/git/revert' || pathName === '/api/git/cherry-pick')) {
+    const { hash } = await readJson<{ hash?: string }>(req);
+    if (!hash || !/^[0-9a-fA-F]{4,40}$/.test(hash)) { sendJson(res, 400, { error: 'Invalid commit hash' }); return; }
+    await sendGitOp(res, pathName.endsWith('revert') ? revertCommit(repoRoot, hash) : cherryPickCommit(repoRoot, hash));
+    return;
+  }
+  if (method === 'POST' && pathName === '/api/git/reset') {
+    const { hash, mode } = await readJson<{ hash?: string; mode?: string }>(req);
+    if (!hash || !/^[0-9a-fA-F]{4,40}$/.test(hash)) { sendJson(res, 400, { error: 'Invalid commit hash' }); return; }
+    const m: 'soft' | 'mixed' | 'hard' = mode === 'soft' || mode === 'hard' ? mode : 'mixed';
+    await sendGitOp(res, resetToCommit(repoRoot, hash, m));
+    return;
+  }
+  if (method === 'POST' && pathName === '/api/git/branch-at') {
+    const { name, hash } = await readJson<{ name?: string; hash?: string }>(req);
+    if (!name || name.startsWith('-') || !/^[\w./-]+$/.test(name)) { sendJson(res, 400, { error: 'Invalid branch name' }); return; }
+    if (!hash || !/^[0-9a-fA-F]{4,40}$/.test(hash)) { sendJson(res, 400, { error: 'Invalid commit hash' }); return; }
+    try { await createBranchAt(repoRoot, name, hash); sendJson(res, 200, { ok: true }); }
+    catch (e) { sendJson(res, 409, { error: e instanceof Error ? e.message : String(e) }); }
+    return;
+  }
+
+  if (method === 'GET' && pathName === '/api/repo/blame') {
+    const rel = url.searchParams.get('path') ?? '';
+    const abs = path.resolve(repoRoot, rel);
+    if (!isInsideRepo(repoRoot, abs)) { sendJson(res, 403, { error: 'Forbidden' }); return; }
+    try { sendJson(res, 200, { blame: await getBlame(repoRoot, rel) }); }
+    catch (e) { sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) }); }
     return;
   }
 
@@ -811,6 +880,17 @@ function safeJoin(root: string, relativePath: string): string | undefined {
 function isInsideRepo(repoRoot: string, abs: string): boolean {
   const rel = path.relative(path.resolve(repoRoot), abs);
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/** Run a git op that may fail (conflict/error), returning its message or a 409. */
+async function sendGitOp(res: ServerResponse, op: Promise<{ message: string }>): Promise<void> {
+  try {
+    sendJson(res, 200, await op);
+  } catch (e: unknown) {
+    const err = e as { stdout?: string; stderr?: string; message?: string };
+    const raw = (err.stdout || err.stderr || err.message || 'Git operation failed.').toString();
+    sendJson(res, 409, { error: raw.split('\n').filter(Boolean).slice(0, 4).join(' ').slice(0, 240) });
+  }
 }
 
 function isWSL(): boolean {

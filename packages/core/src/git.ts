@@ -554,6 +554,111 @@ export async function getBranchComparison(repoRoot: string, base: string): Promi
   };
 }
 
+// ── Blame / annotate ───────────────────────────────────────────────────────────
+
+export interface BlameLine { line: number; hash: string; author: string; date: string; summary: string; }
+
+export async function getBlame(repoRoot: string, file: string): Promise<BlameLine[]> {
+  const { stdout } = await execFileAsync('git', ['blame', '--line-porcelain', '--', file], {
+    cwd: repoRoot,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return parseBlamePorcelain(stdout);
+}
+
+function parseBlamePorcelain(out: string): BlameLine[] {
+  const result: BlameLine[] = [];
+  const meta = new Map<string, { author?: string; time?: number; summary?: string }>();
+  let cur: { hash: string; finalLine: number } | null = null;
+  for (const l of out.split('\n')) {
+    const head = l.match(/^([0-9a-f]{7,40})\s+\d+\s+(\d+)(?:\s+\d+)?$/);
+    if (head) {
+      cur = { hash: head[1], finalLine: Number(head[2]) };
+      if (!meta.has(cur.hash)) meta.set(cur.hash, {});
+      continue;
+    }
+    if (!cur) continue;
+    const m = meta.get(cur.hash)!;
+    if (l.startsWith('author ')) m.author = l.slice(7);
+    else if (l.startsWith('author-time ')) m.time = Number(l.slice(12));
+    else if (l.startsWith('summary ')) m.summary = l.slice(8);
+    else if (l.startsWith('\t')) {
+      result.push({
+        line: cur.finalLine,
+        hash: cur.hash.slice(0, 8),
+        author: m.author ?? '',
+        date: m.time ? new Date(m.time * 1000).toISOString() : '',
+        summary: m.summary ?? '',
+      });
+      cur = null;
+    }
+  }
+  return result;
+}
+
+// ── Discard / rollback ─────────────────────────────────────────────────────────
+
+/** Discard a file's local changes: restore tracked files to HEAD, delete untracked. */
+export async function discardFile(repoRoot: string, file: string): Promise<void> {
+  const tracked = await gitTry(repoRoot, ['ls-files', '--error-unmatch', '--', file]);
+  if (tracked) {
+    await execFileAsync('git', ['restore', '--source=HEAD', '--staged', '--worktree', '--', file], { cwd: repoRoot });
+  } else {
+    await execFileAsync('git', ['clean', '-fd', '--', file], { cwd: repoRoot });
+  }
+}
+
+// ── Stash ──────────────────────────────────────────────────────────────────────
+
+export interface StashEntry { index: number; ref: string; message: string; }
+
+export async function stashList(repoRoot: string): Promise<StashEntry[]> {
+  const out = await gitTry(repoRoot, ['stash', 'list']);
+  return out.split('\n').filter(Boolean).map((l) => {
+    const m = l.match(/^stash@\{(\d+)\}:\s*(.*)$/);
+    return m ? { index: Number(m[1]), ref: `stash@{${m[1]}}`, message: m[2] } : null;
+  }).filter((x): x is StashEntry => x !== null);
+}
+
+export async function stashSave(repoRoot: string, message?: string): Promise<{ message: string }> {
+  const args = ['stash', 'push'];
+  if (message && message.trim()) args.push('-m', message.trim());
+  const { stdout, stderr } = await execFileAsync('git', args, { cwd: repoRoot });
+  return { message: (stdout || stderr || 'Stashed.').trim() };
+}
+
+export async function stashApply(repoRoot: string, index: number, pop: boolean): Promise<{ message: string }> {
+  const { stdout, stderr } = await execFileAsync('git', ['stash', pop ? 'pop' : 'apply', `stash@{${index}}`], { cwd: repoRoot });
+  return { message: (stdout || stderr || (pop ? 'Popped.' : 'Applied.')).trim() };
+}
+
+export async function stashDrop(repoRoot: string, index: number): Promise<{ message: string }> {
+  const { stdout, stderr } = await execFileAsync('git', ['stash', 'drop', `stash@{${index}}`], { cwd: repoRoot });
+  return { message: (stdout || stderr || 'Dropped.').trim() };
+}
+
+// ── Commit actions (IntelliJ Git Log–style) ────────────────────────────────────
+
+export async function revertCommit(repoRoot: string, hash: string): Promise<{ message: string }> {
+  const { stdout, stderr } = await execFileAsync('git', ['revert', '--no-edit', hash], { cwd: repoRoot });
+  return { message: (stdout || stderr || 'Reverted.').trim() };
+}
+
+export async function cherryPickCommit(repoRoot: string, hash: string): Promise<{ message: string }> {
+  const { stdout, stderr } = await execFileAsync('git', ['cherry-pick', hash], { cwd: repoRoot });
+  return { message: (stdout || stderr || 'Cherry-picked.').trim() };
+}
+
+export async function resetToCommit(repoRoot: string, hash: string, mode: 'soft' | 'mixed' | 'hard'): Promise<{ message: string }> {
+  const flag = mode === 'hard' ? '--hard' : mode === 'soft' ? '--soft' : '--mixed';
+  await execFileAsync('git', ['reset', flag, hash], { cwd: repoRoot });
+  return { message: `Reset (${mode}) to ${hash.slice(0, 8)}` };
+}
+
+export async function createBranchAt(repoRoot: string, name: string, hash: string): Promise<void> {
+  await execFileAsync('git', ['checkout', '-b', name, hash], { cwd: repoRoot });
+}
+
 function stripDiffPath(rawPath: string): string {
   if (rawPath === '/dev/null') {
     return rawPath;

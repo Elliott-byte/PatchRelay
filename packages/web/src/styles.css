@@ -838,6 +838,15 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 .stage-toggle.staged { background: var(--green-dim); border-color: rgba(48,209,88,0.4); color: var(--green); }
 .stage-toggle.staged:hover { background: var(--yellow-dim); border-color: rgba(255,214,10,0.4); color: var(--yellow); }
 
+.discard-btn {
+  align-items: center; background: transparent; border: 0; border-radius: 6px;
+  color: var(--text-muted); cursor: pointer; display: flex; flex: 0 0 auto;
+  font-size: 13px; height: 20px; justify-content: center; line-height: 1;
+  opacity: 0; transition: opacity 0.12s, background 0.12s, color 0.12s; width: 20px;
+}
+.file-row:hover .discard-btn { opacity: 1; }
+.discard-btn:hover { background: var(--red-dim); color: var(--red); }
+
 .file-row-label {
   background: transparent; border: 0; cursor: pointer;
   flex: 1 1 0; min-width: 0; padding: 2px; text-align: left;
@@ -889,8 +898,56 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
   transition: background 0.12s;
   width: 100%;
 }
-.commit-row:hover { background: var(--glass-hover); }
-.commit-row.active { background: var(--accent-dim); border-color: rgba(10,132,255,0.2); }
+.commit-row-wrap { position: relative; }
+.commit-row-wrap:hover { background: var(--glass-hover); border-radius: var(--radius-xs); }
+.commit-row-wrap.active { background: var(--accent-dim); border-radius: var(--radius-xs); }
+.commit-row:hover { background: transparent; }
+.commit-row.active { background: transparent; }
+
+.commit-menu-btn {
+  background: transparent; border: 0; border-radius: var(--radius-xs);
+  color: var(--text-muted); cursor: pointer; font-size: 15px; line-height: 1;
+  opacity: 0; padding: 2px 6px; position: absolute; right: 4px; top: 6px; transition: opacity 0.12s;
+}
+.commit-row-wrap:hover .commit-menu-btn { opacity: 1; }
+.commit-menu-btn:hover { background: var(--glass-strong); color: var(--text); }
+
+.commit-menu {
+  backdrop-filter: var(--blur); -webkit-backdrop-filter: var(--blur);
+  background: var(--glass-strong); border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow); display: flex; flex-direction: column;
+  min-width: 180px; padding: 4px; position: absolute; right: 4px; top: 28px; z-index: 100;
+}
+.commit-menu button {
+  background: transparent; border: 0; border-radius: var(--radius-xs); color: var(--text);
+  cursor: pointer; font-size: 12px; padding: 6px 10px; text-align: left; white-space: nowrap;
+}
+.commit-menu button:hover { background: var(--glass-hover); }
+.commit-menu button.danger { color: var(--red); }
+.commit-menu button.danger:hover { background: var(--red-dim); }
+.commit-menu-sep { background: var(--glass-border); height: 1px; margin: 4px 0; }
+
+/* Stashes (History tab) */
+.stash-bar { align-items: center; display: flex; justify-content: space-between; padding: 4px 8px 6px; }
+.stash-save-btn {
+  background: var(--accent-dim); border: 1px solid rgba(10,132,255,0.3); border-radius: var(--radius-xs);
+  color: var(--accent); cursor: pointer; font-size: 11px; font-weight: 600; padding: 3px 9px;
+}
+.stash-save-btn:hover { background: var(--accent-glow); }
+.stash-row {
+  align-items: center; border-radius: var(--radius-xs); display: flex; gap: 6px;
+  margin-bottom: 1px; padding: 5px 8px;
+}
+.stash-row:hover { background: var(--glass-hover); }
+.stash-msg { color: var(--text); flex: 1 1 0; font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stash-actions { align-items: center; display: flex; flex: 0 0 auto; gap: 2px; }
+.stash-actions button {
+  background: transparent; border: 0; border-radius: var(--radius-xs); color: var(--text-2);
+  cursor: pointer; font-size: 11px; padding: 2px 6px;
+}
+.stash-actions button:hover { background: var(--glass-strong); color: var(--text); }
+.stash-actions button.danger:hover { background: var(--red-dim); color: var(--red); }
+.commit-log-title { padding: 8px 8px 4px; }
 .commit-subject {
   color: var(--text); font-size: 12px; font-weight: 500;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%;
@@ -1809,6 +1866,21 @@ button:disabled { cursor: not-allowed; opacity: 0.4; }
 .file-editor-content .cm-editor { height: 100%; background: transparent; }
 .file-editor-content .cm-scroller { overflow: auto; padding-bottom: 72px; }
 .file-editor-content .cm-gutters { background: transparent; border-right: 1px solid var(--glass-border); }
+
+/* Blame gutter + toggle */
+.blame-toggle {
+  background: transparent; border: 0; border-left: 1px solid var(--glass-border);
+  color: var(--text-muted); cursor: pointer; flex-shrink: 0; font-size: 11px; font-weight: 500;
+  margin-left: auto; padding: 0 12px; transition: background 0.12s, color 0.12s;
+}
+.blame-toggle:hover { background: var(--glass-hover); color: var(--text); }
+.blame-toggle.active { background: var(--accent-dim); color: var(--accent); }
+.cm-blame-gutter { background: var(--bg-2); }
+.cm-blame {
+  color: var(--text-muted); cursor: pointer; display: inline-block; font-size: 10px;
+  max-width: 130px; overflow: hidden; padding: 0 8px; text-overflow: ellipsis; white-space: nowrap;
+}
+.cm-blame:hover { color: var(--accent); }
 
 /* ── Empty states ─────────────────────────────────── */
 .empty-state {

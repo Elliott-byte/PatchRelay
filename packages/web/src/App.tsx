@@ -6,6 +6,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import type { SyntaxHighlighterProps } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import CodeMirror, { EditorView } from '@uiw/react-codemirror';
+import { gutter, GutterMarker } from '@codemirror/view';
 import { oneDark as cmOneDark } from '@codemirror/theme-one-dark';
 import { getIcon } from 'material-file-icons';
 import { javascript } from '@codemirror/lang-javascript';
@@ -30,6 +31,8 @@ type ActiveTab = 'files' | 'comments' | 'prompt' | 'compare' | `file:${string}` 
 interface CommitLogEntry { hash: string; shortHash: string; author: string; email: string; date: string; relativeDate: string; subject: string; }
 interface CommitDetail { hash: string; shortHash: string; author: string; email: string; date: string; subject: string; body: string; files: DiffFile[]; }
 interface BranchComparison { base: string; head: string; ahead: number; behind: number; files: DiffFile[]; }
+interface StashEntry { index: number; ref: string; message: string; }
+interface BlameLine { line: number; hash: string; author: string; date: string; summary: string; }
 
 interface SyncStatus { branch: string; upstream: string | null; ahead: number; behind: number; hasRemote: boolean; lastCommit?: { hash: string; subject: string }; }
 interface DiffLine { id: string; type: DiffLineType; raw: string; content: string; oldLine?: number; newLine?: number; }
@@ -96,6 +99,9 @@ export function App() {
   const [commitLogLoading, setCommitLogLoading] = useState(false);
   const [activeCommit, setActiveCommit] = useState<CommitDetail | null>(null);
   const [comparison, setComparison] = useState<BranchComparison | null>(null);
+  const [stashes, setStashes] = useState<StashEntry[]>([]);
+  const [blameOn, setBlameOn] = useState(false);
+  const [blameLines, setBlameLines] = useState<BlameLine[]>([]);
   const [leftWidth, setLeftWidth] = useState(220);
   const [rightWidth, setRightWidth] = useState(320);
   const workspaceRef = useRef<HTMLElement>(null);
@@ -143,9 +149,20 @@ export function App() {
 
   // Load commit history when the History tab opens or the branch changes.
   useEffect(() => {
-    if (leftTab === 'history') void loadCommitLog();
+    if (leftTab === 'history') { void loadCommitLog(); void loadStashes(); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leftTab, branches?.current]);
+
+  // Fetch git blame for the active file when blame mode is on.
+  useEffect(() => {
+    if (!blameOn || !activeTab.startsWith('file:')) { setBlameLines([]); return; }
+    const p = activeTab.slice(5);
+    let cancelled = false;
+    api<{ blame: BlameLine[] }>(`/api/repo/blame?path=${encodeURIComponent(p)}`)
+      .then((d) => { if (!cancelled) setBlameLines(d.blame); })
+      .catch(() => { if (!cancelled) setBlameLines([]); });
+    return () => { cancelled = true; };
+  }, [blameOn, activeTab]);
 
   useEffect(() => {
     let inFlight = false;
@@ -204,6 +221,33 @@ export function App() {
     finally { setSyncing(false); }
   }
 
+  async function loadStashes() {
+    try { setStashes((await api<{ stashes: StashEntry[] }>('/api/git/stash')).stashes); } catch { /* non-fatal */ }
+  }
+  async function stashChanges() {
+    const message = window.prompt('Stash message (optional):', '') ?? undefined;
+    try {
+      const r = await api<{ message: string }>('/api/git/stash', { method: 'POST', body: JSON.stringify({ message }) });
+      flash(r.message.split('\n')[0].slice(0, 100));
+      await Promise.all([refresh(false), loadStashes()]);
+    } catch (e) { setError(msgFor(e)); }
+  }
+  async function applyStash(index: number, pop: boolean) {
+    try {
+      const r = await api<{ message: string }>('/api/git/stash/apply', { method: 'POST', body: JSON.stringify({ index, pop }) });
+      flash(r.message.split('\n')[0].slice(0, 100));
+      await Promise.all([refresh(false), loadStashes()]);
+    } catch (e) { setError(msgFor(e)); }
+  }
+  async function dropStash(index: number) {
+    if (!window.confirm('Drop this stash? This cannot be undone.')) return;
+    try {
+      await api('/api/git/stash/drop', { method: 'POST', body: JSON.stringify({ index }) });
+      flash('Stash dropped');
+      await loadStashes();
+    } catch (e) { setError(msgFor(e)); }
+  }
+
   async function loadCommitLog() {
     setCommitLogLoading(true);
     try {
@@ -218,6 +262,35 @@ export function App() {
       const detail = await api<CommitDetail>(`/api/git/commit?hash=${encodeURIComponent(hash)}`);
       setActiveCommit(detail);
       setActiveTab(`commit:${hash}`);
+    } catch (e) { setError(msgFor(e)); }
+  }
+
+  // IntelliJ Git Log–style commit actions.
+  async function handleCommitAction(action: string, c: CommitLogEntry) {
+    try {
+      if (action === 'copy') { await navigator.clipboard.writeText(c.hash); flash(`Copied ${c.shortHash}`); return; }
+      if (action === 'branch') {
+        const name = window.prompt(`New branch from ${c.shortHash}:`, '');
+        if (!name?.trim()) return;
+        await api('/api/git/branch-at', { method: 'POST', body: JSON.stringify({ name: name.trim(), hash: c.hash }) });
+        flash(`Created ${name.trim()} at ${c.shortHash}`);
+        await Promise.all([loadBranches(), refresh(false), loadCommitLog()]);
+        return;
+      }
+      if (action === 'cherry' || action === 'revert') {
+        const r = await api<{ message: string }>(`/api/git/${action === 'cherry' ? 'cherry-pick' : 'revert'}`, { method: 'POST', body: JSON.stringify({ hash: c.hash }) });
+        flash(r.message.split('\n')[0].slice(0, 100));
+        await Promise.all([refresh(false), loadCommitLog(), loadSyncStatus()]);
+        return;
+      }
+      if (action.startsWith('reset-')) {
+        const mode = action.slice(6) as 'soft' | 'mixed' | 'hard';
+        if (mode === 'hard' && !window.confirm(`Hard reset to ${c.shortHash}?\n\nThis DISCARDS all uncommitted changes and any commits after it. This cannot be undone.`)) return;
+        const r = await api<{ message: string }>('/api/git/reset', { method: 'POST', body: JSON.stringify({ hash: c.hash, mode }) });
+        flash(r.message);
+        await Promise.all([refresh(false), loadCommitLog(), loadSyncStatus()]);
+        return;
+      }
     } catch (e) { setError(msgFor(e)); }
   }
 
@@ -433,9 +506,24 @@ export function App() {
             {fc.length ? <span className="comment-count">💬 {fc.length}</span> : null}
           </span>
         </button>
+        <button
+          className="discard-btn"
+          title={`Discard changes in ${path}`}
+          onClick={() => void discardFileChanges(file)}
+        >↩</button>
       </div>
     );
   };
+
+  async function discardFileChanges(file: DiffFile) {
+    const path = displayPath(file);
+    if (!window.confirm(`Discard all local changes in ${path}?\n\nThis restores the file to the last commit and cannot be undone.`)) return;
+    try {
+      await api('/api/git/discard', { method: 'POST', body: JSON.stringify({ file: path }) });
+      flash(`Discarded changes in ${path.split('/').pop()}`);
+      await refresh(false);
+    } catch (e) { setError(msgFor(e)); }
+  }
 
   async function saveDraft() {
     if (!activeTarget || !draftComment.trim()) return;
@@ -783,24 +871,33 @@ export function App() {
 
           {leftTab === 'history' && (
             <div className="commit-log">
+              <div className="stash-bar">
+                <span className="file-group-title">Stashes{stashes.length ? ` (${stashes.length})` : ''}</span>
+                <button className="stash-save-btn" onClick={() => void stashChanges()} title="Stash working changes">⊟ Stash</button>
+              </div>
+              {stashes.map((s) => (
+                <div className="stash-row" key={s.ref}>
+                  <span className="stash-msg" title={s.message}>{s.message}</span>
+                  <span className="stash-actions">
+                    <button onClick={() => void applyStash(s.index, false)} title="Apply (keep stash)">Apply</button>
+                    <button onClick={() => void applyStash(s.index, true)} title="Pop (apply + remove)">Pop</button>
+                    <button className="danger" onClick={() => void dropStash(s.index)} title="Drop">✕</button>
+                  </span>
+                </div>
+              ))}
+              <div className="file-group-title commit-log-title">Commits</div>
               {commitLogLoading && commitLog.length === 0
                 ? <p className="empty-hint">Loading history…</p>
                 : commitLog.length === 0
                   ? <p className="empty-hint">No commits.</p>
                   : commitLog.map(c => (
-                    <button
+                    <CommitRow
                       key={c.hash}
-                      className={`commit-row${activeTab === `commit:${c.hash}` ? ' active' : ''}`}
-                      onClick={() => void openCommit(c.hash)}
-                      title={`${c.subject}\n${c.author} · ${c.relativeDate}`}
-                    >
-                      <span className="commit-subject">{c.subject}</span>
-                      <span className="commit-meta">
-                        <span className="commit-hash">{c.shortHash}</span>
-                        <span className="commit-author">{c.author}</span>
-                        <span className="commit-date">{c.relativeDate}</span>
-                      </span>
-                    </button>
+                      commit={c}
+                      active={activeTab === `commit:${c.hash}`}
+                      onOpen={() => void openCommit(c.hash)}
+                      onAction={(a) => void handleCommitAction(a, c)}
+                    />
                   ))}
             </div>
           )}
@@ -826,6 +923,13 @@ export function App() {
                   <button className="file-tab-close" onClick={() => closeFileTab(ft.path)} title="Close">×</button>
                 </span>
               ))}
+              {activeTab.startsWith('file:') && (
+                <button
+                  className={`blame-toggle${blameOn ? ' active' : ''}`}
+                  onClick={() => setBlameOn(o => !o)}
+                  title="Toggle git blame (per-line authorship)"
+                >Blame</button>
+              )}
             </div>
           )}
 
@@ -841,6 +945,8 @@ export function App() {
                       revealLine={pendingReveal?.path === ft.path ? pendingReveal.line : undefined}
                       revealName={pendingReveal?.path === ft.path ? pendingReveal.name : undefined}
                       revealNonce={pendingReveal?.path === ft.path ? pendingReveal.nonce : 0}
+                      blame={blameOn && activeTab === `file:${ft.path}` ? blameLines : undefined}
+                      onOpenCommit={(hash) => void openCommit(hash)}
                       onJumpSymbol={(name) => void jumpToSymbol(name)}
                       onChange={(val) => setOpenFileTabs(prev => prev.map(t => t.path === ft.path ? { ...t, content: val } : t))} />
               ))}
@@ -1697,6 +1803,45 @@ function sortedChildren(dir: FsDir): (FsNode | FsDir)[] {
   );
 }
 
+function CommitRow({ commit, active, onOpen, onAction }: {
+  commit: CommitLogEntry; active: boolean; onOpen: () => void; onAction: (action: string) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const h = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) setMenuOpen(false); };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [menuOpen]);
+  const act = (a: string) => { setMenuOpen(false); onAction(a); };
+  return (
+    <div className={`commit-row-wrap${active ? ' active' : ''}`} ref={ref}>
+      <button className="commit-row" onClick={onOpen} title={`${commit.subject}\n${commit.author} · ${commit.relativeDate}`}>
+        <span className="commit-subject">{commit.subject}</span>
+        <span className="commit-meta">
+          <span className="commit-hash">{commit.shortHash}</span>
+          <span className="commit-author">{commit.author}</span>
+          <span className="commit-date">{commit.relativeDate}</span>
+        </span>
+      </button>
+      <button className="commit-menu-btn" title="Commit actions" onClick={(e) => { e.stopPropagation(); setMenuOpen(o => !o); }}>⋯</button>
+      {menuOpen && (
+        <div className="commit-menu">
+          <button onClick={() => act('copy')}>Copy hash</button>
+          <button onClick={() => act('branch')}>New branch here…</button>
+          <button onClick={() => act('cherry')}>Cherry-pick</button>
+          <button onClick={() => act('revert')}>Revert commit</button>
+          <div className="commit-menu-sep" />
+          <button onClick={() => act('reset-soft')}>Reset (soft) to here</button>
+          <button onClick={() => act('reset-mixed')}>Reset (mixed) to here</button>
+          <button className="danger" onClick={() => act('reset-hard')}>Reset (hard) to here</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RepoExplorer({ repoRoot, branch, onOpenFile }: { repoRoot: string; branch?: string; onOpenFile: (path: string) => void }) {
   const [tree, setTree] = useState<FsDir | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -1753,6 +1898,34 @@ function FileIcon({ name }: { name: string }) {
   return <span className="mfi" aria-hidden dangerouslySetInnerHTML={{ __html: svg }} />;
 }
 
+class BlameMarker extends GutterMarker {
+  constructor(readonly text: string, readonly title: string, readonly onClick: () => void) { super(); }
+  toDOM() {
+    const el = document.createElement('span');
+    el.className = 'cm-blame';
+    el.textContent = this.text;
+    el.title = this.title;
+    el.addEventListener('click', this.onClick);
+    return el;
+  }
+}
+
+/** CodeMirror gutter showing per-line git blame (author + date), click → open commit. */
+function blameGutter(byLine: Map<number, BlameLine>, onOpenCommit: (hash: string) => void): Extension {
+  return gutter({
+    class: 'cm-blame-gutter',
+    lineMarker(view, blockInfo) {
+      const ln = view.state.doc.lineAt(blockInfo.from).number;
+      const b = byLine.get(ln);
+      if (!b) return null;
+      const date = b.date ? new Date(b.date).toLocaleDateString() : '';
+      const who = (b.author || '').split(' ')[0].slice(0, 12);
+      return new BlameMarker(`${who} ${date}`.trim(), `${b.hash} · ${b.author} · ${date}\n${b.summary}`, () => onOpenCommit(b.hash));
+    },
+    lineMarkerChange: () => true,
+  });
+}
+
 /**
  * CodeMirror extension: double-click a symbol to jump to its definition.
  * Double-click (rather than single) so normal reading/selecting/cursor placement
@@ -1782,11 +1955,20 @@ interface FileEditorProps {
   revealName?: string;
   revealNonce?: number;
   onJumpSymbol?: (name: string) => void;
+  blame?: BlameLine[];
+  onOpenCommit?: (hash: string) => void;
 }
 
-function FileEditor({ path, content, onChange, revealLine, revealName, revealNonce, onJumpSymbol }: FileEditorProps) {
+function FileEditor({ path, content, onChange, revealLine, revealName, revealNonce, onJumpSymbol, blame, onOpenCommit }: FileEditorProps) {
   const viewRef = useRef<EditorView | null>(null);
-  const extensions = useMemo(() => [...cmLanguage(path), goToDefinition(onJumpSymbol)], [path, onJumpSymbol]);
+  const extensions = useMemo(() => {
+    const ext = [...cmLanguage(path), goToDefinition(onJumpSymbol)];
+    if (blame && blame.length && onOpenCommit) {
+      const byLine = new Map(blame.map((b) => [b.line, b]));
+      ext.unshift(blameGutter(byLine, onOpenCommit));
+    }
+    return ext;
+  }, [path, onJumpSymbol, blame, onOpenCommit]);
 
   // Scroll to + select the jumped-to symbol whenever a reveal is requested.
   // A freshly-mounted editor hasn't measured its layout yet, so scrolling once
